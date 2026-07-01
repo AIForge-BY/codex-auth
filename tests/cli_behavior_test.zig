@@ -1,0 +1,1566 @@
+const std = @import("std");
+const cli = @import("codex_auth").cli;
+const fs = @import("codex_auth").core.compat_fs;
+const registry = @import("codex_auth").registry;
+
+const ansi = struct {
+    const reset = "\x1b[0m";
+    const cyan = "\x1b[36m";
+    const green = "\x1b[32m";
+    const red = "\x1b[31m";
+};
+
+fn makeRegistry() registry.Registry {
+    return .{
+        .schema_version = registry.current_schema_version,
+        .active_account_key = null,
+        .active_account_activated_at_ms = null,
+        .api = registry.defaultApiConfig(),
+        .accounts = std.ArrayList(registry.AccountRecord).empty,
+    };
+}
+
+fn appendAccount(
+    allocator: std.mem.Allocator,
+    reg: *registry.Registry,
+    record_key: []const u8,
+    email: []const u8,
+    alias: []const u8,
+    plan: registry.PlanType,
+) !void {
+    const sep = std.mem.lastIndexOf(u8, record_key, "::") orelse return error.InvalidRecordKey;
+    const chatgpt_user_id = record_key[0..sep];
+    const chatgpt_account_id = record_key[sep + 2 ..];
+    try reg.accounts.append(allocator, .{
+        .account_key = try allocator.dupe(u8, record_key),
+        .chatgpt_account_id = try allocator.dupe(u8, chatgpt_account_id),
+        .chatgpt_user_id = try allocator.dupe(u8, chatgpt_user_id),
+        .email = try allocator.dupe(u8, email),
+        .alias = try allocator.dupe(u8, alias),
+        .account_name = null,
+        .plan = plan,
+        .auth_mode = .chatgpt,
+        .created_at = 1,
+        .last_used_at = null,
+        .last_usage = null,
+        .last_usage_at = null,
+        .last_local_rollout = null,
+    });
+}
+
+fn expectHelp(result: cli.types.ParseResult, topic: cli.types.HelpTopic) !void {
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .help => |actual| try std.testing.expectEqual(topic, actual),
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+fn expectUsageError(result: cli.types.ParseResult, topic: cli.types.HelpTopic, contains: ?[]const u8) !void {
+    switch (result) {
+        .usage_error => |usage_err| {
+            try std.testing.expectEqual(topic, usage_err.topic);
+            if (contains) |needle| {
+                try std.testing.expect(std.mem.indexOf(u8, usage_err.message, needle) != null);
+            }
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+fn expectArgv(actual: []const []const u8, expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |expected_arg, actual_arg| {
+        try std.testing.expectEqualStrings(expected_arg, actual_arg);
+    }
+}
+
+test "Scenario: Given app launch overrides when parsing then IDs and paths are preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{
+        "codex-auth",
+        "app",
+        "--id",
+        "OpenAI.Codex",
+        "--codex-cli-path",
+        "codex-custom",
+        "--codex-home",
+        "/mnt/c/Users/Loong/.codext",
+        "--platform",
+        "win",
+        "--std",
+    };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .app => |opts| {
+                try std.testing.expectEqual(cli.types.AppAction.launch, opts.action);
+                try std.testing.expectEqualStrings("OpenAI.Codex", opts.app_id.?);
+                try std.testing.expectEqualStrings("codex-custom", opts.codex_cli_path.?);
+                try std.testing.expectEqualStrings("/mnt/c/Users/Loong/.codext", opts.codex_home.?);
+                try std.testing.expectEqual(cli.types.AppPlatform.win, opts.platform.?);
+                try std.testing.expect(opts.inherit_stdio);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given gui state flags when parsing then gui state options are preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "gui", "state", "--skip-api", "--active" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .gui => |opts| switch (opts) {
+                .state => |state_opts| {
+                    try std.testing.expectEqual(cli.types.ApiMode.skip_api, state_opts.api_mode);
+                    try std.testing.expect(state_opts.active_only);
+                },
+                else => return error.TestExpectedEqual,
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given gui refresh api flag when parsing then gui refresh options are preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "gui", "refresh", "--api" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .gui => |opts| switch (opts) {
+                .refresh => |refresh_opts| try std.testing.expectEqual(cli.types.ApiMode.force_api, refresh_opts.api_mode),
+                else => return error.TestExpectedEqual,
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given gui switch account key when parsing then key is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "gui", "switch", "acct-key" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .gui => |opts| switch (opts) {
+                .switch_account => |account_key| try std.testing.expectEqualStrings("acct-key", account_key),
+                else => return error.TestExpectedEqual,
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given gui alias set when parsing then key and alias are preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "gui", "alias", "set", "acct-key", "Work" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .gui => |opts| switch (opts) {
+                .alias => |alias_opts| switch (alias_opts) {
+                    .set => |set_opts| {
+                        try std.testing.expectEqualStrings("acct-key", set_opts.account_key);
+                        try std.testing.expectEqualStrings("Work", set_opts.alias);
+                    },
+                    else => return error.TestExpectedEqual,
+                },
+                else => return error.TestExpectedEqual,
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given gui import with alias when parsing then path and alias are preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "gui", "import", "/tmp/auth.json", "--alias", "Work" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .gui => |opts| switch (opts) {
+                .import_auth => |import_opts| {
+                    try std.testing.expectEqualStrings("/tmp/auth.json", import_opts.auth_path);
+                    try std.testing.expectEqualStrings("Work", import_opts.alias.?);
+                },
+                else => return error.TestExpectedEqual,
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given app passthrough args when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "app", "--", "--trace" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .app, "`app` does not accept passthrough arguments.");
+}
+
+test "Scenario: Given removed app launch subcommand when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "app", "launch" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .app, "unexpected argument `launch` for `app`.");
+}
+
+test "Scenario: Given removed app status subcommand when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "app", "status" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .app, "unexpected argument `status` for `app`.");
+}
+
+test "Scenario: Given removed app patch subcommand when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "app", "patch", "--platform", "wsl" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .app, "unexpected argument `patch` for `app`.");
+}
+
+test "Scenario: Given removed app unpatch subcommand when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "app", "unpatch" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .app, "unexpected argument `unpatch` for `app`.");
+}
+
+test "Scenario: Given import path and alias when parsing then import options are preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "import", "/tmp/auth.json", "--alias", "personal" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .import_auth => |opts| {
+                try std.testing.expect(opts.auth_path != null);
+                try std.testing.expect(std.mem.eql(u8, opts.auth_path.?, "/tmp/auth.json"));
+                try std.testing.expect(opts.alias != null);
+                try std.testing.expect(std.mem.eql(u8, opts.alias.?, "personal"));
+                try std.testing.expect(!opts.purge);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given import purge without path when parsing then purge mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "import", "--purge" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .import_auth => |opts| {
+                try std.testing.expect(opts.auth_path == null);
+                try std.testing.expect(opts.alias == null);
+                try std.testing.expect(opts.purge);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given import cpa without path when parsing then cpa mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "import", "--cpa" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .import_auth => |opts| {
+                try std.testing.expect(opts.auth_path == null);
+                try std.testing.expect(opts.alias == null);
+                try std.testing.expect(!opts.purge);
+                try std.testing.expectEqual(cli.types.ImportSource.cpa, opts.source);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given import cpa with purge when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "import", "--cpa", "--purge" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .import_auth, "`--purge`");
+}
+
+test "Scenario: Given export directory when parsing then export options are preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "export", "/tmp/codex-backup" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .export_auth => |opts| {
+                try std.testing.expect(opts.dest_path != null);
+                try std.testing.expectEqualStrings("/tmp/codex-backup", opts.dest_path.?);
+                try std.testing.expectEqual(cli.types.ExportFormat.standard, opts.format);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given export cpa without directory when parsing then cpa mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "export", "--cpa" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .export_auth => |opts| {
+                try std.testing.expect(opts.dest_path == null);
+                try std.testing.expectEqual(cli.types.ExportFormat.cpa, opts.format);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given import unknown short purge flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "import", "-P", "/tmp/auth.json" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .import_auth, "unknown flag");
+}
+
+test "Scenario: Given import alias without path when parsing then usage error is returned without leaks" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "import", "--alias", "personal" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .import_auth, "requires a path");
+}
+
+test "Scenario: Given list with extra args when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "list", "unexpected" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .list, "unexpected argument");
+}
+
+test "Scenario: Given list with skip-api flag when parsing then local-only display mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "list", "--skip-api" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .list => |opts| try std.testing.expectEqual(cli.types.ApiMode.skip_api, opts.api_mode),
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given list with active flag when parsing then active-only refresh mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "list", "--active" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .list => |opts| try std.testing.expect(opts.active_only),
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given list with live flag when parsing then live mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "list", "--live" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .list => |opts| try std.testing.expect(opts.live),
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given list with api flag when parsing then forced api mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "list", "--api" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .list => |opts| try std.testing.expectEqual(cli.types.ApiMode.force_api, opts.api_mode),
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given login with removed no-login flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "login", "--no-login" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .login, "unknown flag");
+}
+
+test "Scenario: Given login with unknown flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "login", "--bad-flag" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .login, "unknown flag");
+}
+
+test "Scenario: Given login with device auth flag when parsing then device auth is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "login", "--device-auth" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .login => |opts| try std.testing.expect(opts.device_auth),
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given login with duplicate device auth flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "login", "--device-auth", "--device-auth" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .login, "duplicate `--device-auth`");
+}
+
+test "Scenario: Given command help selector when parsing then command-specific help is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "help", "list" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectHelp(result, .list);
+}
+
+test "Scenario: Given help when rendering then login and command help notes are shown" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    try cli.help.writeHelp(&aw.writer, false);
+
+    const help = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, help, "Commands:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "list [--live] [--active] [--api|--skip-api]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "switch [--live] [--api|--skip-api]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "alias set <alias|email|display-number|query> <alias>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "config live --interval <seconds>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "auto enable") == null);
+}
+
+test "Scenario: Given simple command help when rendering then examples are omitted" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    try cli.help.writeCommandHelp(&aw.writer, false, .list);
+
+    const help = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, help, "codex-auth list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "List available accounts.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Usage:\n  codex-auth list [--live] [--active] [--api|--skip-api]\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Options:\n  --live") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--active     Refresh only the active account before rendering.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--skip-api   Load usage and account data from local data only (may be inaccurate).") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Examples:") == null);
+}
+
+test "Scenario: Given command help with color when rendering then section titles use header style" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    try cli.help.writeCommandHelp(&aw.writer, true, .switch_account);
+
+    const help = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, help, ansi.cyan ++ "Usage:" ++ ansi.reset ++ "\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, ansi.cyan ++ "Examples:" ++ ansi.reset ++ "\n") != null);
+}
+
+test "Scenario: Given complex command help when rendering then examples are shown" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    try cli.help.writeCommandHelp(&aw.writer, false, .import_auth);
+
+    const help = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, help, "codex-auth import") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Usage:\n  codex-auth import <path> [--alias <alias>]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Options:\n  <path>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Uses `~/.cli-proxy-api` when omitted.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--purge [<path>] Rebuild `registry.json` from auth files.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Examples:\n  codex-auth import /path/to/auth.json --alias personal\n") != null);
+}
+
+test "Scenario: Given switch command help when rendering then target forms and multi-match behavior are shown" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    try cli.help.writeCommandHelp(&aw.writer, false, .switch_account);
+
+    const help = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, help, "codex-auth switch <alias|email|display-number|query>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "codex-auth switch personal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "codex-auth switch john@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "codex-auth switch 02") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "codex-auth switch work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Options:\n  --live       Open the live switch UI.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Switch directly when the target resolves to one account.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "If a target is ambiguous") == null);
+}
+
+test "Scenario: Given remove command help when rendering then options explain live API all and target forms" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    try cli.help.writeCommandHelp(&aw.writer, false, .remove_account);
+
+    const help = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, help, "Options:\n  --live       Open the live remove UI.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--api        Load usage and account data from APIs.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--all        Remove every stored account.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Remove one or more matching accounts.") != null);
+}
+
+test "Scenario: Given alias command help when rendering then set and clear examples are shown" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    try cli.help.writeCommandHelp(&aw.writer, false, .alias);
+
+    const help = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, help, "codex-auth alias set <alias|email|display-number|query> <alias>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "codex-auth alias clear <alias|email|display-number|query>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "codex-auth alias set 02 work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "New aliases cannot be empty or only digits.") != null);
+}
+
+test "Scenario: Given config help when rendering then live mode is explained" {
+    const gpa = std.testing.allocator;
+    var config_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer config_aw.deinit();
+
+    try cli.help.writeCommandHelp(&config_aw.writer, false, .config);
+
+    const config_help = config_aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, config_help, "codex-auth config live --interval <seconds>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_help, "live --interval <seconds>\n                    Set the live TUI refresh interval from 5 to 3600 seconds.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_help, "codex-auth config live --interval 60") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_help, "auto") == null);
+}
+
+test "Scenario: Given scanned import report when rendering then stdout and stderr match the import format" {
+    const gpa = std.testing.allocator;
+    var stdout_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer stdout_aw.deinit();
+    var stderr_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer stderr_aw.deinit();
+
+    var report = registry.ImportReport.init(.scanned);
+    defer report.deinit(gpa);
+    report.source_label = try gpa.dupe(u8, "./tokens/");
+    try report.addEvent(gpa, "token_ryan.taylor.alpha@email.com.json", .imported, null);
+    try report.addEvent(gpa, "token_jane.smith.alpha@email.com.json", .updated, null);
+    try report.addEvent(gpa, "token_invalid.json", .skipped, "InvalidJSON");
+
+    try cli.output.writeImportReport(&stdout_aw.writer, &stderr_aw.writer, &report);
+
+    const expected_stdout = try std.fmt.allocPrint(
+        gpa,
+        "Scanning ./tokens/...\n" ++
+            "  imported  token_ryan.taylor.alpha@email.com.json\n" ++
+            "  updated   token_jane.smith.alpha@email.com.json\n" ++
+            "Import Summary: 1 imported, 1 updated, 1 skipped (total 3 files)\n",
+        .{},
+    );
+    defer gpa.free(expected_stdout);
+    try std.testing.expectEqualStrings(expected_stdout, stdout_aw.written());
+
+    const expected_stderr = try std.fmt.allocPrint(
+        gpa,
+        "  skipped   token_invalid.json: InvalidJSON\n",
+        .{},
+    );
+    defer gpa.free(expected_stderr);
+    try std.testing.expectEqualStrings(expected_stderr, stderr_aw.written());
+}
+
+test "Scenario: Given single-file skipped import report when rendering then summary stays concise" {
+    const gpa = std.testing.allocator;
+    var stdout_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer stdout_aw.deinit();
+    var stderr_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer stderr_aw.deinit();
+
+    var report = registry.ImportReport.init(.single_file);
+    defer report.deinit(gpa);
+    try report.addEvent(gpa, "token_bob.wilson.alpha@email.com.json", .skipped, "MissingEmail");
+
+    try cli.output.writeImportReport(&stdout_aw.writer, &stderr_aw.writer, &report);
+
+    try std.testing.expectEqualStrings(
+        "Import Summary: 0 imported, 1 skipped\n",
+        stdout_aw.written(),
+    );
+    const expected_stderr = try std.fmt.allocPrint(
+        gpa,
+        "  skipped   token_bob.wilson.alpha@email.com.json: MissingEmail\n",
+        .{},
+    );
+    defer gpa.free(expected_stderr);
+    try std.testing.expectEqualStrings(expected_stderr, stderr_aw.written());
+}
+
+test "Scenario: Given array import report when rendering then items are grouped under the filename" {
+    const gpa = std.testing.allocator;
+    var stdout_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer stdout_aw.deinit();
+    var stderr_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer stderr_aw.deinit();
+
+    var report = registry.ImportReport.init(.scanned);
+    defer report.deinit(gpa);
+    report.source_label = try gpa.dupe(u8, "./tokens/");
+    try report.addEvent(gpa, "one_token_file.json", .imported, null);
+    try report.addItemEvent(gpa, "tokens_array.json", 1, .imported, null, "frank@example.com");
+    try report.addItemEvent(gpa, "tokens_array.json", 2, .skipped, "MissingEmail", null);
+    try report.addEvent(gpa, "another_token_file.json", .updated, null);
+
+    try cli.output.writeImportReport(&stdout_aw.writer, &stderr_aw.writer, &report);
+
+    try std.testing.expectEqualStrings(
+        "Scanning ./tokens/...\n" ++
+            "  imported  one_token_file.json\n" ++
+            "tokens_array.json:\n" ++
+            "  [1] imported  frank@example.com\n" ++
+            "  [2] skipped   MissingEmail\n" ++
+            "  updated   another_token_file.json\n" ++
+            "Import Summary: 2 imported, 1 updated, 1 skipped (total 3 files)\n",
+        stdout_aw.written(),
+    );
+    try std.testing.expectEqualStrings("", stderr_aw.written());
+}
+
+test "Scenario: Given color import report when rendering then success and errors use ANSI colors without markers" {
+    const gpa = std.testing.allocator;
+    var stdout_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer stdout_aw.deinit();
+    var stderr_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer stderr_aw.deinit();
+
+    var report = registry.ImportReport.init(.scanned);
+    defer report.deinit(gpa);
+    report.source_label = try gpa.dupe(u8, "./tokens/");
+    try report.addEvent(gpa, "token_carol.three@example.com.json", .updated, null);
+    try report.addEvent(gpa, "token_invalid.json", .skipped, "InvalidJSON");
+
+    try cli.output.writeImportReportWithColor(&stdout_aw.writer, &stderr_aw.writer, &report, true, true);
+
+    try std.testing.expect(std.mem.indexOf(u8, stdout_aw.written(), ansi.green ++ "  updated   token_carol.three@example.com.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_aw.written(), ansi.red ++ "  skipped   token_invalid.json: InvalidJSON") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_aw.written(), "✓") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_aw.written(), "✗") == null);
+}
+
+test "Scenario: Given removed top-level auto command when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "auto", "enable" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .top_level, "unknown command `auto`");
+}
+
+test "Scenario: Given removed config api section when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "config", "api", "status" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .config, "unknown config section `api`");
+}
+
+test "Scenario: Given config live interval when parsing then interval is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "config", "live", "--interval", "30" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .config => |opts| switch (opts) {
+                .live => |live_opts| try std.testing.expectEqual(@as(u16, 30), live_opts.interval_seconds),
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given config live invalid interval when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "config", "live", "--interval", "4" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .config, "`--interval` must be an integer from 5 to 3600 seconds.");
+}
+
+test "Scenario: Given config live unknown flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "config", "live", "--refresh", "30" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .config, "unknown flag `--refresh` for `config live`.");
+}
+
+test "Scenario: Given alias set when parsing then selector and alias are preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "alias", "set", "john@example.com", "work" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .alias => |opts| switch (opts) {
+                .set => |set_opts| {
+                    try std.testing.expectEqualStrings("john@example.com", set_opts.selector);
+                    try std.testing.expectEqualStrings("work", set_opts.alias);
+                },
+                else => return error.TestExpectedEqual,
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given alias clear when parsing then selector is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "alias", "clear", "work" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .alias => |opts| switch (opts) {
+                .clear => |clear_opts| try std.testing.expectEqualStrings("work", clear_opts.selector),
+                else => return error.TestExpectedEqual,
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given alias set missing value when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "alias", "set", "work" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .alias, "`alias set` requires a selector and alias.");
+}
+
+test "Scenario: Given alias unknown subcommand when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "alias", "rename", "work", "personal" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .alias, "unknown alias subcommand `rename`");
+}
+
+test "Scenario: Given migrate when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "migrate" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .top_level, "unknown command `migrate`");
+}
+
+test "Scenario: Given clean when parsing then clean command is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "clean" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .clean => {},
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given clean background when parsing then background target is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "clean", "background" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .clean => |opts| try std.testing.expectEqual(cli.types.CleanTarget.background, opts.target),
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given codex login access denied when rendering then plain English retry hint is included" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    try cli.output.writeCodexLoginLaunchFailureHintTo(&aw.writer, "AccessDenied", false);
+
+    const hint = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, hint, "failed to launch the `codex login` process.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hint, "Try running `codex login` manually, then retry your command.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hint, "AccessDenied") == null);
+}
+
+test "Scenario: Given codex login client missing when rendering then detection hint is included" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    try cli.output.writeCodexLoginLaunchFailureHintTo(&aw.writer, "FileNotFound", false);
+
+    const hint = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, hint, "the `codex` executable was not found in your PATH.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hint, "Ensure the Codex CLI is installed and available in your environment.") != null);
+}
+
+test "Scenario: Given PowerShell is missing for the codex ps1 launcher when rendering then the hint names PowerShell" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    try cli.output.writeCodexLoginLaunchFailureHintTo(&aw.writer, "PowerShellNotFound", false);
+
+    const hint = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, hint, "the `codex.ps1` launcher requires PowerShell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hint, "Install PowerShell, or use a Codex CLI installation that provides `codex.exe`, `codex.cmd`, or `codex.bat`, then retry your command.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hint, "the `codex` executable was not found in your PATH.") == null);
+}
+
+test "Scenario: Given login help when rendering then device auth usage is included" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+
+    try cli.help.writeCommandHelp(&aw.writer, false, .login);
+
+    const help = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, help, "codex-auth login --device-auth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "Options:\n  --device-auth   Run `codex login --device-auth` before adding the account.") != null);
+}
+
+test "Scenario: Given login options when building codex argv then device auth is forwarded" {
+    try expectArgv(cli.login.codexLoginArgs(.{}), &[_][]const u8{ "codex", "login" });
+    try expectArgv(cli.login.codexLoginArgs(.{ .device_auth = true }), &[_][]const u8{ "codex", "login", "--device-auth" });
+}
+
+test "Scenario: Given winget and npm Windows launchers when resolving then PATH entry order is preserved" {
+    const gpa = std.testing.allocator;
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("winget-bin");
+    try tmp.dir.makePath("npm-bin");
+    try tmp.dir.writeFile(.{ .sub_path = "winget-bin/codex.exe", .data = "" });
+    try tmp.dir.writeFile(.{ .sub_path = "npm-bin/codex", .data = "#!/bin/sh\nexit 1\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "npm-bin/codex.cmd", .data = "@echo off\r\nexit /b 0\r\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "npm-bin/codex.bat", .data = "@echo off\r\nexit /b 0\r\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "npm-bin/codex.ps1", .data = "exit 0\n" });
+    const root_dir = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root_dir);
+    const winget_dir = try std.fs.path.join(gpa, &[_][]const u8{ root_dir, "winget-bin" });
+    defer gpa.free(winget_dir);
+    const npm_dir = try std.fs.path.join(gpa, &[_][]const u8{ root_dir, "npm-bin" });
+    defer gpa.free(npm_dir);
+
+    var exe_first = (try cli.login.resolveWindowsCodexPathEntriesAlloc(gpa, &[_][]const u8{ winget_dir, npm_dir })) orelse return error.TestUnexpectedResult;
+    defer exe_first.deinit(gpa);
+    try std.testing.expectEqual(cli.login.WindowsCodexPathKind.exe, exe_first.kind);
+    try std.testing.expect(std.mem.endsWith(u8, exe_first.path, "codex.exe"));
+
+    var cmd_first = (try cli.login.resolveWindowsCodexPathEntriesAlloc(gpa, &[_][]const u8{ npm_dir, winget_dir })) orelse return error.TestUnexpectedResult;
+    defer cmd_first.deinit(gpa);
+    try std.testing.expectEqual(cli.login.WindowsCodexPathKind.cmd, cmd_first.kind);
+    try std.testing.expect(std.mem.endsWith(u8, cmd_first.path, "codex.cmd"));
+}
+
+test "Scenario: Given exe cmd bat and ps1 in one Windows directory when resolving then the fixed launcher priority wins" {
+    const gpa = std.testing.allocator;
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("mixed-bin");
+    try tmp.dir.writeFile(.{ .sub_path = "mixed-bin/codex.exe", .data = "" });
+    try tmp.dir.writeFile(.{ .sub_path = "mixed-bin/codex.cmd", .data = "@echo off\r\nexit /b 0\r\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "mixed-bin/codex.bat", .data = "@echo off\r\nexit /b 0\r\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "mixed-bin/codex.ps1", .data = "exit 0\n" });
+    const root_dir = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root_dir);
+    const mixed_dir = try std.fs.path.join(gpa, &[_][]const u8{ root_dir, "mixed-bin" });
+    defer gpa.free(mixed_dir);
+
+    var resolved = (try cli.login.resolveWindowsCodexPathEntriesAlloc(gpa, &[_][]const u8{mixed_dir})) orelse return error.TestUnexpectedResult;
+    defer resolved.deinit(gpa);
+    try std.testing.expectEqual(cli.login.WindowsCodexPathKind.exe, resolved.kind);
+    try std.testing.expect(std.mem.endsWith(u8, resolved.path, "codex.exe"));
+}
+
+test "Scenario: Given only a batch Windows launcher when resolving then bat is used before ps1" {
+    const gpa = std.testing.allocator;
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("npm-bin");
+    try tmp.dir.writeFile(.{ .sub_path = "npm-bin/codex", .data = "#!/bin/sh\nexit 1\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "npm-bin/codex.bat", .data = "@echo off\r\nexit /b 0\r\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "npm-bin/codex.ps1", .data = "exit 0\n" });
+
+    const root_dir = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root_dir);
+    const npm_dir = try std.fs.path.join(gpa, &[_][]const u8{ root_dir, "npm-bin" });
+    defer gpa.free(npm_dir);
+
+    var resolved = (try cli.login.resolveWindowsCodexPathEntriesAlloc(gpa, &[_][]const u8{npm_dir})) orelse return error.TestUnexpectedResult;
+    defer resolved.deinit(gpa);
+    try std.testing.expectEqual(cli.login.WindowsCodexPathKind.bat, resolved.kind);
+    try std.testing.expect(std.mem.endsWith(u8, resolved.path, "codex.bat"));
+}
+
+test "Scenario: Given only the bare npm shell launcher on Windows when resolving then it is ignored" {
+    const gpa = std.testing.allocator;
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("npm-bin");
+    try tmp.dir.writeFile(.{ .sub_path = "npm-bin/codex", .data = "#!/bin/sh\nexit 1\n" });
+
+    const root_dir = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root_dir);
+    const npm_dir = try std.fs.path.join(gpa, &[_][]const u8{ root_dir, "npm-bin" });
+    defer gpa.free(npm_dir);
+
+    try std.testing.expect((try cli.login.resolveWindowsCodexPathEntriesAlloc(gpa, &[_][]const u8{npm_dir})) == null);
+}
+
+test "Scenario: Given an earlier PowerShell launcher and a later native Windows launcher when resolving then ps1 stays a global fallback" {
+    const gpa = std.testing.allocator;
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("npm-bin");
+    try tmp.dir.makePath("winget-bin");
+    try tmp.dir.writeFile(.{ .sub_path = "npm-bin/codex", .data = "#!/bin/sh\nexit 1\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "npm-bin/codex.ps1", .data = "exit 0\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "winget-bin/codex.exe", .data = "" });
+
+    const root_dir = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root_dir);
+    const npm_dir = try std.fs.path.join(gpa, &[_][]const u8{ root_dir, "npm-bin" });
+    defer gpa.free(npm_dir);
+    const winget_dir = try std.fs.path.join(gpa, &[_][]const u8{ root_dir, "winget-bin" });
+    defer gpa.free(winget_dir);
+
+    var resolved = (try cli.login.resolveWindowsCodexPathEntriesAlloc(gpa, &[_][]const u8{ npm_dir, winget_dir })) orelse return error.TestUnexpectedResult;
+    defer resolved.deinit(gpa);
+
+    try std.testing.expectEqual(cli.login.WindowsCodexPathKind.exe, resolved.kind);
+    try std.testing.expect(std.mem.endsWith(u8, resolved.path, "codex.exe"));
+}
+
+test "Scenario: Given only PowerShell Windows launcher when resolving then ps1 is used after cmd is absent" {
+    const gpa = std.testing.allocator;
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("npm-bin");
+    try tmp.dir.writeFile(.{ .sub_path = "npm-bin/codex", .data = "#!/bin/sh\nexit 1\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "npm-bin/codex.ps1", .data = "exit 0\n" });
+
+    const root_dir = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root_dir);
+    const npm_dir = try std.fs.path.join(gpa, &[_][]const u8{ root_dir, "npm-bin" });
+    defer gpa.free(npm_dir);
+
+    var resolved = (try cli.login.resolveWindowsCodexPathEntriesAlloc(gpa, &[_][]const u8{npm_dir})) orelse return error.TestUnexpectedResult;
+    defer resolved.deinit(gpa);
+    try std.testing.expectEqual(cli.login.WindowsCodexPathKind.ps1, resolved.kind);
+    try std.testing.expect(std.mem.endsWith(u8, resolved.path, "codex.ps1"));
+}
+
+test "Scenario: Given retryable Windows build and spawn failures when selecting the final hint then build failure beats generic FileNotFound" {
+    const failure = cli.login.finalRetryableWindowsCodexLaunchFailure(
+        error.FileNotFound,
+        .powershell_not_found,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("PowerShellNotFound", failure.hint_name);
+    try std.testing.expect(failure.err == error.PowerShellNotFound);
+}
+
+test "Scenario: Given retryable Windows build and spawn failures when selecting the final hint then non-generic spawn failure still wins" {
+    const failure = cli.login.finalRetryableWindowsCodexLaunchFailure(
+        error.AccessDenied,
+        .powershell_not_found,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("AccessDenied", failure.hint_name);
+    try std.testing.expect(failure.err == error.AccessDenied);
+}
+
+test "Scenario: Given switch with positional query when parsing then non-interactive target is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "user@example.com" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .switch_account => |opts| {
+                switch (opts.target) {
+                    .query => |query| try std.testing.expectEqualStrings("user@example.com", query),
+                    else => return error.TestExpectedEqual,
+                }
+                try std.testing.expectEqual(cli.types.ApiMode.default, opts.api_mode);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given top-level dash when parsing then previous switch is selected" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "-" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .switch_account => |opts| {
+                try std.testing.expectEqual(cli.types.SwitchTarget.previous, opts.target);
+                try std.testing.expectEqual(cli.types.ApiMode.default, opts.api_mode);
+                try std.testing.expect(!opts.live);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given switch dash when parsing then previous switch is selected" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "-" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .switch_account => |opts| {
+                try std.testing.expectEqual(cli.types.SwitchTarget.previous, opts.target);
+                try std.testing.expectEqual(cli.types.ApiMode.default, opts.api_mode);
+                try std.testing.expect(!opts.live);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given switch query with skip-api flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--skip-api", "02" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .switch_account, "does not support");
+}
+
+test "Scenario: Given switch interactive with live flag when parsing then live mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--live" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .switch_account => |opts| {
+                try std.testing.expect(opts.live);
+                try std.testing.expectEqual(cli.types.SwitchTarget.picker, opts.target);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given switch with removed auto flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--live", "--auto" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .switch_account, "unknown flag `--auto`");
+}
+
+test "Scenario: Given switch with removed auto flag without live when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--auto" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .switch_account, "unknown flag `--auto`");
+}
+
+test "Scenario: Given switch query with live flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--live", "02" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .switch_account, "does not support");
+}
+
+test "Scenario: Given switch interactive with skip-api flag when parsing then skip-api mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--skip-api" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .switch_account => |opts| {
+                try std.testing.expectEqual(cli.types.SwitchTarget.picker, opts.target);
+                try std.testing.expectEqual(cli.types.ApiMode.skip_api, opts.api_mode);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given switch interactive with api flag when parsing then api mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--api" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .switch_account => |opts| {
+                try std.testing.expectEqual(cli.types.SwitchTarget.picker, opts.target);
+                try std.testing.expectEqual(cli.types.ApiMode.force_api, opts.api_mode);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given switch query with api flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--api", "02" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .switch_account, "does not support");
+}
+
+test "Scenario: Given switch dash with api flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--api", "-" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .switch_account, "switch -|<alias|email|display-number|query>");
+}
+
+test "Scenario: Given switch dash with live flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--live", "-" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .switch_account, "switch -|<alias|email|display-number|query>");
+}
+
+test "Scenario: Given switch dash with skip-api flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--skip-api", "-" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .switch_account, "switch -|<alias|email|display-number|query>");
+}
+
+test "Scenario: Given switch query with removed auto flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--live", "--auto", "02" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .switch_account, "unknown flag `--auto`");
+}
+
+test "Scenario: Given switch with duplicate target when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "a@example.com", "b@example.com" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .switch_account, "unexpected extra query");
+}
+
+test "Scenario: Given switch with unexpected flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "switch", "--email", "a@example.com" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .switch_account, "unknown flag");
+}
+
+test "Scenario: Given remove with positional query when parsing then selector mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "remove", "user@example.com" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .remove_account => |opts| {
+                try std.testing.expectEqual(@as(usize, 1), opts.selectors.len);
+                try std.testing.expect(std.mem.eql(u8, opts.selectors[0], "user@example.com"));
+                try std.testing.expect(!opts.all);
+                try std.testing.expectEqual(cli.types.ApiMode.default, opts.api_mode);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given remove with all flag when parsing then all mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "remove", "--all" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .remove_account => |opts| {
+                try std.testing.expectEqual(@as(usize, 0), opts.selectors.len);
+                try std.testing.expect(opts.all);
+                try std.testing.expectEqual(cli.types.ApiMode.default, opts.api_mode);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given remove with multiple selectors when parsing then all selectors are preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "remove", "01", "b@example.com", "03" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .remove_account => |opts| {
+                try std.testing.expectEqual(@as(usize, 3), opts.selectors.len);
+                try std.testing.expect(std.mem.eql(u8, opts.selectors[0], "01"));
+                try std.testing.expect(std.mem.eql(u8, opts.selectors[1], "b@example.com"));
+                try std.testing.expect(std.mem.eql(u8, opts.selectors[2], "03"));
+                try std.testing.expect(!opts.all);
+                try std.testing.expectEqual(cli.types.ApiMode.default, opts.api_mode);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given interactive remove with skip-api flag when parsing then skip-api mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "remove", "--skip-api" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .remove_account => |opts| {
+                try std.testing.expectEqual(cli.types.ApiMode.skip_api, opts.api_mode);
+                try std.testing.expect(!opts.live);
+                try std.testing.expectEqual(@as(usize, 0), opts.selectors.len);
+                try std.testing.expect(!opts.all);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given interactive remove with live flag when parsing then live mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "remove", "--live" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .remove_account => |opts| {
+                try std.testing.expect(opts.live);
+                try std.testing.expectEqual(@as(usize, 0), opts.selectors.len);
+                try std.testing.expect(!opts.all);
+                try std.testing.expectEqual(cli.types.ApiMode.default, opts.api_mode);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given interactive remove with api flag when parsing then api mode is preserved" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "remove", "--api" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    switch (result) {
+        .command => |cmd| switch (cmd) {
+            .remove_account => |opts| {
+                try std.testing.expectEqual(cli.types.ApiMode.force_api, opts.api_mode);
+                try std.testing.expect(!opts.live);
+                try std.testing.expectEqual(@as(usize, 0), opts.selectors.len);
+                try std.testing.expect(!opts.all);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "Scenario: Given remove query with skip-api flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "remove", "--skip-api", "01" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .remove_account, "do not support `--live`, `--api`, or `--skip-api`");
+}
+
+test "Scenario: Given remove query with live flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "remove", "--live", "01" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .remove_account, "do not support");
+}
+
+test "Scenario: Given remove query with api flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "remove", "--api", "work" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .remove_account, "do not support `--live`, `--api`, or `--skip-api`");
+}
+
+test "Scenario: Given remove all with api flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "remove", "--api", "--all" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .remove_account, "do not support `--live`, `--api`, or `--skip-api`");
+}
+
+test "Scenario: Given remove with unexpected flag when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "remove", "--email" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .remove_account, "unknown flag");
+}
+
+test "Scenario: Given remove with all and query when parsing then usage error is returned" {
+    const gpa = std.testing.allocator;
+    const args = [_][:0]const u8{ "codex-auth", "remove", "--all", "a@example.com" };
+    var result = try cli.commands.parseArgs(gpa, &args);
+    defer cli.commands.freeParseResult(gpa, &result);
+
+    try expectUsageError(result, .remove_account, "cannot combine `--all`");
+}
+
+test "Scenario: Given multiple removed accounts when rendering summary then emails are joined on one line" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const emails = [_][]const u8{ "alpha@example.com", "beta@example.com" };
+
+    try cli.output.writeRemoveSummaryTo(&aw.writer, &emails);
+
+    try std.testing.expectEqualStrings(
+        "Removed 2 account(s): alpha@example.com, beta@example.com\n",
+        aw.written(),
+    );
+}
+
+test "Scenario: Given multiple matched accounts when rendering confirmation then the prompt lists each email" {
+    const gpa = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const emails = [_][]const u8{ "alpha@example.com", "beta@example.com" };
+
+    try cli.output.writeRemoveConfirmationTo(&aw.writer, &emails);
+
+    try std.testing.expectEqualStrings(
+        "Matched multiple accounts:\n" ++
+            "- alpha@example.com\n" ++
+            "- beta@example.com\n" ++
+            "Confirm delete? [y/N]: ",
+        aw.written(),
+    );
+}
+
+test "Scenario: Given singleton aliases from different emails when building remove labels then each label keeps email context" {
+    const gpa = std.testing.allocator;
+    var reg = makeRegistry();
+    defer reg.deinit(gpa);
+
+    try appendAccount(gpa, &reg, "user-4QmYj7PkN2sLx8AcVbR3TwHd::67fe2bbb-0de6-49a4-b2b3-d1df366d1faf", "alpha@example.com", "work", .team);
+    try appendAccount(gpa, &reg, "user-8LnCq5VzR1mHx9SfKpT4JdWe::518a44d9-ba75-4bad-87e5-ae9377042960", "beta@example.com", "work", .team);
+
+    const indices = [_]usize{ 0, 1 };
+    var labels = try cli.output.buildRemoveLabels(gpa, &reg, &indices);
+    defer {
+        for (labels.items) |label| gpa.free(@constCast(label));
+        labels.deinit(gpa);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), labels.items.len);
+    try std.testing.expectEqualStrings("work(alpha@example.com)", labels.items[0]);
+    try std.testing.expectEqualStrings("work(beta@example.com)", labels.items[1]);
+}
+
+test "Scenario: Given singleton account names from different emails when building remove labels then each label keeps email context" {
+    const gpa = std.testing.allocator;
+    var reg = makeRegistry();
+    defer reg.deinit(gpa);
+
+    try appendAccount(gpa, &reg, "user-4QmYj7PkN2sLx8AcVbR3TwHd::67fe2bbb-0de6-49a4-b2b3-d1df366d1faf", "alpha@example.com", "", .team);
+    reg.accounts.items[0].account_name = try gpa.dupe(u8, "Workspace");
+    try appendAccount(gpa, &reg, "user-8LnCq5VzR1mHx9SfKpT4JdWe::518a44d9-ba75-4bad-87e5-ae9377042960", "beta@example.com", "", .team);
+    reg.accounts.items[1].account_name = try gpa.dupe(u8, "Workspace");
+
+    const indices = [_]usize{ 0, 1 };
+    var labels = try cli.output.buildRemoveLabels(gpa, &reg, &indices);
+    defer {
+        for (labels.items) |label| gpa.free(@constCast(label));
+        labels.deinit(gpa);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), labels.items.len);
+    try std.testing.expectEqualStrings("Workspace(alpha@example.com)", labels.items[0]);
+    try std.testing.expectEqualStrings("Workspace(beta@example.com)", labels.items[1]);
+}
+
+test "Scenario: Given selector environment when deciding switch or remove UI then only non-tty streams use the numbered selector" {
+    try std.testing.expect(cli.picker.shouldUseNumberedSwitchSelector(false, false, true));
+    try std.testing.expect(cli.picker.shouldUseNumberedSwitchSelector(false, true, false));
+    try std.testing.expect(!cli.picker.shouldUseNumberedSwitchSelector(false, true, true));
+    try std.testing.expect(!cli.picker.shouldUseNumberedSwitchSelector(true, true, true));
+
+    try std.testing.expect(cli.picker.shouldUseNumberedRemoveSelector(false, false, true));
+    try std.testing.expect(cli.picker.shouldUseNumberedRemoveSelector(false, true, false));
+    try std.testing.expect(!cli.picker.shouldUseNumberedRemoveSelector(false, true, true));
+    try std.testing.expect(!cli.picker.shouldUseNumberedRemoveSelector(true, true, true));
+}

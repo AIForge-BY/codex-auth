@@ -1,0 +1,4451 @@
+const std = @import("std");
+const app_runtime = @import("codex_auth").core.runtime;
+const fs = @import("codex_auth").core.compat_fs;
+const builtin = @import("builtin");
+const registry = @import("codex_auth").registry;
+const fixtures = @import("support/fixtures.zig");
+
+const cli_integration_install_prefix_env = "CODEX_AUTH_CLI_INTEGRATION_INSTALL_PREFIX";
+const cli_integration_project_root_env = "CODEX_AUTH_CLI_INTEGRATION_PROJECT_ROOT";
+
+var cli_build_ready = false;
+var cli_build_mutex: std.Io.Mutex = .init;
+
+fn getEnvMap(allocator: std.mem.Allocator) !std.process.Environ.Map {
+    return try app_runtime.currentEnviron().createMap(allocator);
+}
+
+fn getEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    var env_map = try getEnvMap(allocator);
+    defer env_map.deinit();
+
+    const value = env_map.get(name) orelse return error.EnvironmentVariableNotFound;
+    return try allocator.dupe(u8, value);
+}
+
+const SeedAccount = struct {
+    email: []const u8,
+    alias: []const u8,
+};
+
+const future_primary_reset_at: i64 = 4_102_444_800;
+const future_secondary_reset_at: i64 = 4_103_049_600;
+
+fn projectRootAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const project_root = getEnvVarOwned(allocator, cli_integration_project_root_env) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    if (project_root) |path| return path;
+    const tests_dir = std.fs.path.dirname(@src().file) orelse return error.FileNotFound;
+    const repo_root = std.fs.path.dirname(tests_dir) orelse return error.FileNotFound;
+    return try allocator.dupe(u8, repo_root);
+}
+
+fn runCapture(
+    allocator: std.mem.Allocator,
+    cwd_path: []const u8,
+    env_map: ?*const std.process.Environ.Map,
+    argv: []const []const u8,
+) !std.process.RunResult {
+    const raw_result = std.process.run(std.heap.page_allocator, fs.io(), .{
+        .argv = argv,
+        .cwd = .{ .path = cwd_path },
+        .environ_map = env_map,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.SkipZigTest,
+        else => return err,
+    };
+    defer std.heap.page_allocator.free(raw_result.stdout);
+    defer std.heap.page_allocator.free(raw_result.stderr);
+
+    return .{
+        .term = raw_result.term,
+        .stdout = try allocator.dupe(u8, raw_result.stdout),
+        .stderr = try allocator.dupe(u8, raw_result.stderr),
+    };
+}
+
+fn buildCliBinary(allocator: std.mem.Allocator, project_root: []const u8) !void {
+    cli_build_mutex.lockUncancelable(fs.io());
+    defer cli_build_mutex.unlock(fs.io());
+
+    if (cli_build_ready) return;
+
+    var env_map = try getEnvMap(allocator);
+    defer env_map.deinit();
+    const global_cache_dir = if (env_map.get("ZIG_GLOBAL_CACHE_DIR")) |dir|
+        try allocator.dupe(u8, dir)
+    else
+        try fs.path.join(allocator, &[_][]const u8{
+            project_root,
+            ".zig-cache",
+            "cli-integration-global",
+        });
+    defer allocator.free(global_cache_dir);
+
+    const local_cache_dir = if (env_map.get("ZIG_LOCAL_CACHE_DIR")) |dir|
+        try allocator.dupe(u8, dir)
+    else
+        try fs.path.join(allocator, &[_][]const u8{
+            project_root,
+            ".zig-cache",
+            "cli-integration-local",
+        });
+    defer allocator.free(local_cache_dir);
+    const install_prefix = if (env_map.get(cli_integration_install_prefix_env)) |dir|
+        try allocator.dupe(u8, dir)
+    else
+        try fs.path.join(allocator, &[_][]const u8{ project_root, "zig-out" });
+    defer allocator.free(install_prefix);
+
+    try env_map.put("ZIG_GLOBAL_CACHE_DIR", global_cache_dir);
+    try env_map.put("ZIG_LOCAL_CACHE_DIR", local_cache_dir);
+    try env_map.put(cli_integration_install_prefix_env, install_prefix);
+
+    const result = try runCapture(allocator, project_root, &env_map, &[_][]const u8{ "zig", "build", "-p", install_prefix, "test-helpers" });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code == 0) {
+            cli_build_ready = true;
+            return;
+        },
+        else => {},
+    }
+
+    std.log.err("zig build stdout:\n{s}", .{result.stdout});
+    std.log.err("zig build stderr:\n{s}", .{result.stderr});
+    return error.CommandFailed;
+}
+
+fn builtCliPathAlloc(allocator: std.mem.Allocator, project_root: []const u8) ![]u8 {
+    const exe_name = if (builtin.os.tag == .windows) "codex-auth.exe" else "codex-auth";
+    const install_prefix = getEnvVarOwned(allocator, cli_integration_install_prefix_env) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer if (install_prefix) |dir| allocator.free(dir);
+
+    const prefix = install_prefix orelse return fs.path.join(allocator, &[_][]const u8{ project_root, "zig-out", "bin", exe_name });
+    return fs.path.join(allocator, &[_][]const u8{ prefix, "bin", exe_name });
+}
+
+fn fakeCodexCommandPath() []const u8 {
+    return if (builtin.os.tag == .windows) "fake-bin/codex.cmd" else "fake-bin/codex";
+}
+
+fn fakeCodexPowerShellPath() []const u8 {
+    return "fake-bin/codex.ps1";
+}
+
+fn fakeCodexBatchPath() []const u8 {
+    return "fake-bin/codex.bat";
+}
+
+fn fakeCodexExePath() []const u8 {
+    return "fake-bin/codex.exe";
+}
+
+fn fakeBareWindowsCodexPath() []const u8 {
+    return "fake-bin/codex";
+}
+
+fn writeFailingFakeCodex(dir: fs.Dir, exit_code: u8) !void {
+    var script_buf: [128]u8 = undefined;
+    const script = if (builtin.os.tag == .windows)
+        try std.fmt.bufPrint(&script_buf, "@echo off\r\n>\"%HOME%\\fake-codex-argv.txt\" echo %*\r\nexit /b {d}\r\n", .{exit_code})
+    else
+        try std.fmt.bufPrint(&script_buf, "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$HOME/fake-codex-argv.txt\"\nexit {d}\n", .{exit_code});
+    const sub_path = fakeCodexCommandPath();
+    try dir.writeFile(.{ .sub_path = sub_path, .data = script });
+
+    if (builtin.os.tag != .windows) {
+        var file = try dir.openFile(sub_path, .{ .mode = .read_write });
+        defer file.close();
+        try file.chmod(0o755);
+    }
+}
+
+fn writeSuccessfulFakeCodex(dir: fs.Dir) !void {
+    const script =
+        if (builtin.os.tag == .windows)
+            "@echo off\r\n" ++
+                ">\"%HOME%\\fake-codex-launcher.txt\" echo cmd\r\n" ++
+                ">\"%HOME%\\fake-codex-argv.txt\" echo %*\r\n" ++
+                ">\"%HOME%\\fake-codex-home.txt\" echo %CODEX_HOME%\r\n" ++
+                "set \"CODEX_HOME_DIR=%CODEX_HOME%\"\r\n" ++
+                "if \"%CODEX_HOME_DIR%\"==\"\" set \"CODEX_HOME_DIR=%HOME%\\.codex\"\r\n" ++
+                "if not exist \"%CODEX_HOME_DIR%\" mkdir \"%CODEX_HOME_DIR%\"\r\n" ++
+                "copy /Y \"%HOME%\\fake-auth.json\" \"%CODEX_HOME_DIR%\\auth.json\" >NUL\r\n" ++
+                "exit /b 0\r\n"
+        else
+            "#!/bin/sh\n" ++
+                "printf '%s\\n' 'posix' > \"$HOME/fake-codex-launcher.txt\"\n" ++
+                "printf '%s\\n' \"$*\" > \"$HOME/fake-codex-argv.txt\"\n" ++
+                "printf '%s\\n' \"$CODEX_HOME\" > \"$HOME/fake-codex-home.txt\"\n" ++
+                "CODEX_HOME_DIR=\"${CODEX_HOME:-$HOME/.codex}\"\n" ++
+                "mkdir -p \"$CODEX_HOME_DIR\"\n" ++
+                "cp \"$HOME/fake-auth.json\" \"$CODEX_HOME_DIR/auth.json\"\n" ++
+                "exit 0\n";
+    const sub_path = fakeCodexCommandPath();
+    try dir.writeFile(.{ .sub_path = sub_path, .data = script });
+
+    if (builtin.os.tag != .windows) {
+        var file = try dir.openFile(sub_path, .{ .mode = .read_write });
+        defer file.close();
+        try file.chmod(0o755);
+    }
+}
+
+fn writeStrictExistingCodexHomeFakeCodex(dir: fs.Dir) !void {
+    const script =
+        if (builtin.os.tag == .windows)
+            "@echo off\r\n" ++
+                ">\"%HOME%\\fake-codex-launcher.txt\" echo cmd\r\n" ++
+                ">\"%HOME%\\fake-codex-argv.txt\" echo %*\r\n" ++
+                ">\"%HOME%\\fake-codex-home.txt\" echo %CODEX_HOME%\r\n" ++
+                "set \"CODEX_HOME_DIR=%CODEX_HOME%\"\r\n" ++
+                "if \"%CODEX_HOME_DIR%\"==\"\" set \"CODEX_HOME_DIR=%HOME%\\.codex\"\r\n" ++
+                "if not exist \"%CODEX_HOME_DIR%\" exit /b 42\r\n" ++
+                "copy /Y \"%HOME%\\fake-auth.json\" \"%CODEX_HOME_DIR%\\auth.json\" >NUL\r\n" ++
+                "exit /b 0\r\n"
+        else
+            "#!/bin/sh\n" ++
+                "printf '%s\\n' 'posix' > \"$HOME/fake-codex-launcher.txt\"\n" ++
+                "printf '%s\\n' \"$*\" > \"$HOME/fake-codex-argv.txt\"\n" ++
+                "printf '%s\\n' \"$CODEX_HOME\" > \"$HOME/fake-codex-home.txt\"\n" ++
+                "CODEX_HOME_DIR=\"${CODEX_HOME:-$HOME/.codex}\"\n" ++
+                "[ -d \"$CODEX_HOME_DIR\" ] || exit 42\n" ++
+                "cp \"$HOME/fake-auth.json\" \"$CODEX_HOME_DIR/auth.json\"\n" ++
+                "exit 0\n";
+    const sub_path = fakeCodexCommandPath();
+    try dir.writeFile(.{ .sub_path = sub_path, .data = script });
+
+    if (builtin.os.tag != .windows) {
+        var file = try dir.openFile(sub_path, .{ .mode = .read_write });
+        defer file.close();
+        try file.chmod(0o755);
+    }
+}
+
+fn writeStrictExistingCodexHomeFakeCodexBatch(dir: fs.Dir) !void {
+    if (builtin.os.tag != .windows) return;
+
+    const script =
+        "@echo off\r\n" ++
+        ">\"%HOME%\\fake-codex-launcher.txt\" echo bat\r\n" ++
+        ">\"%HOME%\\fake-codex-argv.txt\" echo %*\r\n" ++
+        ">\"%HOME%\\fake-codex-home.txt\" echo %CODEX_HOME%\r\n" ++
+        "set \"CODEX_HOME_DIR=%CODEX_HOME%\"\r\n" ++
+        "if \"%CODEX_HOME_DIR%\"==\"\" set \"CODEX_HOME_DIR=%HOME%\\.codex\"\r\n" ++
+        "if not exist \"%CODEX_HOME_DIR%\" exit /b 42\r\n" ++
+        "copy /Y \"%HOME%\\fake-auth.json\" \"%CODEX_HOME_DIR%\\auth.json\" >NUL\r\n" ++
+        "exit /b 0\r\n";
+
+    try dir.writeFile(.{ .sub_path = fakeCodexBatchPath(), .data = script });
+}
+
+fn writeBrokenBareWindowsCodex(dir: fs.Dir) !void {
+    if (builtin.os.tag != .windows) return;
+    try dir.writeFile(.{
+        .sub_path = fakeBareWindowsCodexPath(),
+        .data = "#!/bin/sh\nexit 99\n",
+    });
+}
+
+fn writeSuccessfulFakeCodexPowerShellAt(dir: fs.Dir, sub_path: []const u8) !void {
+    if (builtin.os.tag != .windows) return;
+
+    const script =
+        "$homePath = $env:HOME\r\n" ++
+        "[System.IO.File]::WriteAllText((Join-Path $homePath 'fake-codex-launcher.txt'), \"ps1`n\")\r\n" ++
+        "[System.IO.File]::WriteAllText((Join-Path $homePath 'fake-codex-argv.txt'), (($args -join ' ') + \"`n\"))\r\n" ++
+        "[System.IO.File]::WriteAllText((Join-Path $homePath 'fake-codex-home.txt'), ($env:CODEX_HOME + \"`n\"))\r\n" ++
+        "$codexHomeDir = $env:CODEX_HOME\r\n" ++
+        "if ([string]::IsNullOrEmpty($codexHomeDir)) { $codexHomeDir = Join-Path $homePath '.codex' }\r\n" ++
+        "if (-not (Test-Path -LiteralPath $codexHomeDir)) { New-Item -ItemType Directory -Path $codexHomeDir | Out-Null }\r\n" ++
+        "Copy-Item -Force (Join-Path $homePath 'fake-auth.json') (Join-Path $codexHomeDir 'auth.json')\r\n";
+
+    try dir.writeFile(.{ .sub_path = sub_path, .data = script });
+}
+
+fn writeSuccessfulFakeCodexPowerShell(dir: fs.Dir) !void {
+    try writeSuccessfulFakeCodexPowerShellAt(dir, fakeCodexPowerShellPath());
+}
+
+fn writeSuccessfulFakeCodexExeAt(
+    allocator: std.mem.Allocator,
+    dir: fs.Dir,
+    project_root: []const u8,
+    sub_path: []const u8,
+) !void {
+    if (builtin.os.tag != .windows) return;
+
+    const built_fake_codex = try builtFakeCodexPathAlloc(allocator, project_root);
+    defer allocator.free(built_fake_codex);
+    const fake_codex_data = try fixtures.readFileAlloc(allocator, built_fake_codex);
+    defer allocator.free(fake_codex_data);
+    try dir.writeFile(.{ .sub_path = sub_path, .data = fake_codex_data });
+}
+
+fn writeSuccessfulFakeCodexExe(
+    allocator: std.mem.Allocator,
+    dir: fs.Dir,
+    project_root: []const u8,
+) !void {
+    try writeSuccessfulFakeCodexExeAt(allocator, dir, project_root, fakeCodexExePath());
+}
+
+fn fakeCurlCommandPath() []const u8 {
+    return if (builtin.os.tag == .windows) "fake-curl-bin/curl.exe" else "fake-curl-bin/curl";
+}
+
+fn writeFailingFakeCurl(allocator: std.mem.Allocator, dir: fs.Dir, project_root: []const u8) !void {
+    try dir.makePath("fake-curl-bin");
+    if (builtin.os.tag == .windows) {
+        const built_fake_curl = try builtFakeCurlFailPathAlloc(allocator, project_root);
+        defer allocator.free(built_fake_curl);
+        const fake_curl_data = try fixtures.readFileAlloc(allocator, built_fake_curl);
+        defer allocator.free(fake_curl_data);
+        try dir.writeFile(.{ .sub_path = fakeCurlCommandPath(), .data = fake_curl_data });
+        return;
+    }
+
+    var script_buf: [160]u8 = undefined;
+    const script = try std.fmt.bufPrint(&script_buf, "#!/bin/sh\nexit 1\n", .{});
+    const sub_path = fakeCurlCommandPath();
+    try dir.writeFile(.{ .sub_path = sub_path, .data = script });
+
+    var file = try dir.openFile(sub_path, .{ .mode = .read_write });
+    defer file.close();
+    try file.chmod(0o755);
+}
+
+fn writeApiKeyFlowFakeCurl(allocator: std.mem.Allocator, dir: fs.Dir, project_root: []const u8) !void {
+    try dir.makePath("fake-curl-bin");
+    if (builtin.os.tag == .windows) {
+        const built_fake_curl = try builtFakeCurlPathAlloc(allocator, project_root);
+        defer allocator.free(built_fake_curl);
+        const fake_curl_data = try fixtures.readFileAlloc(allocator, built_fake_curl);
+        defer allocator.free(fake_curl_data);
+        try dir.writeFile(.{ .sub_path = fakeCurlCommandPath(), .data = fake_curl_data });
+        return;
+    }
+
+    const me_body = "{\"id\":\"user_api_e2e\",\"email\":\"apikey-flow@example.com\",\"name\":\"API Flow\"}";
+    const usage_body = "{\"plan_type\":\"plus\",\"rate_limit\":{\"primary_window\":{\"used_percent\":12,\"limit_window_seconds\":18000,\"reset_at\":4102444800},\"secondary_window\":{\"used_percent\":34,\"limit_window_seconds\":604800,\"reset_at\":4103049600}}}";
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\n" ++
+            "config=$(cat)\n" ++
+            "case \"$config\" in\n" ++
+            "  */v1/me*) printf '%s\\n200' '{s}' ;;\n" ++
+            "  *) printf '%s\\n200' '{s}' ;;\n" ++
+            "esac\n",
+        .{ me_body, usage_body },
+    );
+    defer allocator.free(script);
+
+    const sub_path = fakeCurlCommandPath();
+    try dir.writeFile(.{ .sub_path = sub_path, .data = script });
+
+    var file = try dir.openFile(sub_path, .{ .mode = .read_write });
+    defer file.close();
+    try file.chmod(0o755);
+}
+
+fn builtFakeCurlPathAlloc(allocator: std.mem.Allocator, project_root: []const u8) ![]u8 {
+    const exe_name = if (builtin.os.tag == .windows) "curl.exe" else "curl";
+    const install_prefix = getEnvVarOwned(allocator, cli_integration_install_prefix_env) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer if (install_prefix) |dir| allocator.free(dir);
+
+    const prefix = install_prefix orelse return fs.path.join(allocator, &[_][]const u8{ project_root, "zig-out", "bin", exe_name });
+    return fs.path.join(allocator, &[_][]const u8{ prefix, "bin", exe_name });
+}
+
+fn builtFakeCurlFailPathAlloc(allocator: std.mem.Allocator, project_root: []const u8) ![]u8 {
+    const exe_name = if (builtin.os.tag == .windows) "curl-fail.exe" else "curl-fail";
+    const install_prefix = getEnvVarOwned(allocator, cli_integration_install_prefix_env) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer if (install_prefix) |dir| allocator.free(dir);
+
+    const prefix = install_prefix orelse return fs.path.join(allocator, &[_][]const u8{ project_root, "zig-out", "bin", exe_name });
+    return fs.path.join(allocator, &[_][]const u8{ prefix, "bin", exe_name });
+}
+
+fn builtFakeCodexPathAlloc(allocator: std.mem.Allocator, project_root: []const u8) ![]u8 {
+    const exe_name = if (builtin.os.tag == .windows) "fake-codex.exe" else "fake-codex";
+    const install_prefix = getEnvVarOwned(allocator, cli_integration_install_prefix_env) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer if (install_prefix) |dir| allocator.free(dir);
+
+    const prefix = install_prefix orelse return fs.path.join(allocator, &[_][]const u8{ project_root, "zig-out", "bin", exe_name });
+    return fs.path.join(allocator, &[_][]const u8{ prefix, "bin", exe_name });
+}
+
+fn prependPathEntryAlloc(allocator: std.mem.Allocator, entry: []const u8) ![]u8 {
+    var env_map = try getEnvMap(allocator);
+    defer env_map.deinit();
+
+    const inherited_path = env_map.get("PATH") orelse return allocator.dupe(u8, entry);
+    return try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ entry, fs.path.delimiter, inherited_path });
+}
+
+fn runCliWithIsolatedHomeAndPathAndApiKeyCurl(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    home_root: []const u8,
+    path_override: []const u8,
+    args: []const []const u8,
+) !std.process.RunResult {
+    const exe_path = try builtCliPathAlloc(allocator, project_root);
+    defer allocator.free(exe_path);
+
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, exe_path);
+    try argv.appendSlice(allocator, args);
+
+    var env_map = try getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_root);
+    try env_map.put("USERPROFILE", home_root);
+    _ = env_map.swapRemove("CODEX_HOME");
+    try env_map.put("PATH", path_override);
+    try env_map.put("CODEX_AUTH_SKIP_SERVICE_RECONCILE", "1");
+
+    return try runCapture(allocator, project_root, &env_map, argv.items);
+}
+
+fn runCliWithIsolatedHome(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    home_root: []const u8,
+    args: []const []const u8,
+) !std.process.RunResult {
+    const exe_path = try builtCliPathAlloc(allocator, project_root);
+    defer allocator.free(exe_path);
+
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, exe_path);
+    try argv.appendSlice(allocator, args);
+
+    var env_map = try getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_root);
+    try env_map.put("USERPROFILE", home_root);
+    _ = env_map.swapRemove("CODEX_HOME");
+    try env_map.put("CODEX_AUTH_SKIP_SERVICE_RECONCILE", "1");
+
+    return try runCapture(allocator, project_root, &env_map, argv.items);
+}
+
+fn runCliWithIsolatedHomeAndCodexHome(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    home_root: []const u8,
+    codex_home: []const u8,
+    args: []const []const u8,
+) !std.process.RunResult {
+    const exe_path = try builtCliPathAlloc(allocator, project_root);
+    defer allocator.free(exe_path);
+
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, exe_path);
+    try argv.appendSlice(allocator, args);
+
+    var env_map = try getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_root);
+    try env_map.put("USERPROFILE", home_root);
+    try env_map.put("CODEX_HOME", codex_home);
+    try env_map.put("CODEX_AUTH_SKIP_SERVICE_RECONCILE", "1");
+
+    return try runCapture(allocator, project_root, &env_map, argv.items);
+}
+
+fn runCliWithIsolatedHomeAndCodexHomeAndPath(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    home_root: []const u8,
+    codex_home: []const u8,
+    path_override: []const u8,
+    args: []const []const u8,
+) !std.process.RunResult {
+    const exe_path = try builtCliPathAlloc(allocator, project_root);
+    defer allocator.free(exe_path);
+
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, exe_path);
+    try argv.appendSlice(allocator, args);
+
+    var env_map = try getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_root);
+    try env_map.put("USERPROFILE", home_root);
+    try env_map.put("CODEX_HOME", codex_home);
+    try env_map.put("PATH", path_override);
+    try env_map.put("CODEX_AUTH_SKIP_SERVICE_RECONCILE", "1");
+
+    return try runCapture(allocator, project_root, &env_map, argv.items);
+}
+
+fn runCliWithIsolatedHomeAndPath(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    home_root: []const u8,
+    path_override: []const u8,
+    args: []const []const u8,
+) !std.process.RunResult {
+    const exe_path = try builtCliPathAlloc(allocator, project_root);
+    defer allocator.free(exe_path);
+
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, exe_path);
+    try argv.appendSlice(allocator, args);
+
+    var env_map = try getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_root);
+    try env_map.put("USERPROFILE", home_root);
+    _ = env_map.swapRemove("CODEX_HOME");
+    try env_map.put("PATH", path_override);
+    try env_map.put("CODEX_AUTH_SKIP_SERVICE_RECONCILE", "1");
+
+    return try runCapture(allocator, project_root, &env_map, argv.items);
+}
+
+fn runCliWithIsolatedHomeAndPathAndStdin(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    home_root: []const u8,
+    path_override: []const u8,
+    args: []const []const u8,
+    stdin_data: []const u8,
+) !std.process.RunResult {
+    const exe_path = try builtCliPathAlloc(allocator, project_root);
+    defer allocator.free(exe_path);
+
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, exe_path);
+    try argv.appendSlice(allocator, args);
+
+    var env_map = try getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_root);
+    try env_map.put("USERPROFILE", home_root);
+    _ = env_map.swapRemove("CODEX_HOME");
+    try env_map.put("PATH", path_override);
+    try env_map.put("CODEX_AUTH_SKIP_SERVICE_RECONCILE", "1");
+
+    var child = std.process.spawn(fs.io(), .{
+        .argv = argv.items,
+        .cwd = .{ .path = project_root },
+        .environ_map = &env_map,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.SkipZigTest,
+        else => return err,
+    };
+    defer child.kill(fs.io());
+
+    if (child.stdin) |stdin_pipe| {
+        const wrapped_stdin = fs.wrapFile(stdin_pipe);
+        wrapped_stdin.writeAll(stdin_data) catch |err| switch (err) {
+            error.BrokenPipe => {},
+            else => return err,
+        };
+        wrapped_stdin.close();
+        child.stdin = null;
+    }
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, fs.io(), multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+
+    while (multi_reader.fill(64, .none)) |_| {
+        if (stdout_reader.buffered().len > 1024 * 1024) return error.StreamTooLong;
+        if (stderr_reader.buffered().len > 1024 * 1024) return error.StreamTooLong;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+
+    try multi_reader.checkAnyError();
+    const term = try child.wait(fs.io());
+
+    return .{
+        .stdout = try multi_reader.toOwnedSlice(0),
+        .stderr = try multi_reader.toOwnedSlice(1),
+        .term = term,
+    };
+}
+
+fn runCliWithIsolatedHomeAndStdin(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    home_root: []const u8,
+    args: []const []const u8,
+    stdin_data: []const u8,
+) !std.process.RunResult {
+    const exe_path = try builtCliPathAlloc(allocator, project_root);
+    defer allocator.free(exe_path);
+
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, exe_path);
+    try argv.appendSlice(allocator, args);
+
+    var env_map = try getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_root);
+    try env_map.put("USERPROFILE", home_root);
+    _ = env_map.swapRemove("CODEX_HOME");
+    try env_map.put("CODEX_AUTH_SKIP_SERVICE_RECONCILE", "1");
+
+    var child = std.process.spawn(fs.io(), .{
+        .argv = argv.items,
+        .cwd = .{ .path = project_root },
+        .environ_map = &env_map,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.SkipZigTest,
+        else => return err,
+    };
+    defer child.kill(fs.io());
+
+    if (child.stdin) |stdin_pipe| {
+        const wrapped_stdin = fs.wrapFile(stdin_pipe);
+        wrapped_stdin.writeAll(stdin_data) catch |err| switch (err) {
+            error.BrokenPipe => {},
+            else => return err,
+        };
+        wrapped_stdin.close();
+        child.stdin = null;
+    }
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, fs.io(), multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+
+    while (multi_reader.fill(64, .none)) |_| {
+        if (stdout_reader.buffered().len > 1024 * 1024) return error.StreamTooLong;
+        if (stderr_reader.buffered().len > 1024 * 1024) return error.StreamTooLong;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+
+    try multi_reader.checkAnyError();
+    const term = try child.wait(fs.io());
+
+    return .{
+        .stdout = try multi_reader.toOwnedSlice(0),
+        .stderr = try multi_reader.toOwnedSlice(1),
+        .term = term,
+    };
+}
+
+fn expectSuccess(result: std.process.RunResult) !void {
+    switch (result.term) {
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn expectFailure(result: std.process.RunResult) !void {
+    switch (result.term) {
+        .exited => |code| try std.testing.expect(code != 0),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn logRunResultIfFailed(label: []const u8, result: std.process.RunResult) void {
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    std.log.err("{s} failed with term {any}\nstdout:\n{s}\nstderr:\n{s}", .{
+        label,
+        result.term,
+        result.stdout,
+        result.stderr,
+    });
+}
+
+fn authJsonPathAlloc(allocator: std.mem.Allocator, home_root: []const u8) ![]u8 {
+    return fs.path.join(allocator, &[_][]const u8{ home_root, ".codex", "auth.json" });
+}
+
+fn codexHomeAlloc(allocator: std.mem.Allocator, home_root: []const u8) ![]u8 {
+    return fs.path.join(allocator, &[_][]const u8{ home_root, ".codex" });
+}
+
+fn countAuthBackups(dir: fs.Dir, rel_path: []const u8) !usize {
+    var accounts = try dir.openDir(rel_path, .{ .iterate = true });
+    defer accounts.close();
+
+    var count: usize = 0;
+    var it = accounts.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.startsWith(u8, entry.name, "auth.json.bak.")) count += 1;
+    }
+    return count;
+}
+
+fn legacySnapshotNameForEmail(allocator: std.mem.Allocator, email: []const u8) ![]u8 {
+    const encoded = try fixtures.b64url(allocator, email);
+    defer allocator.free(encoded);
+    return try std.fmt.allocPrint(allocator, "{s}.auth.json", .{encoded});
+}
+
+fn seedRegistryWithAccounts(
+    allocator: std.mem.Allocator,
+    home_root: []const u8,
+    active_email: []const u8,
+    entries: []const SeedAccount,
+) !void {
+    const codex_home = try codexHomeAlloc(allocator, home_root);
+    defer allocator.free(codex_home);
+
+    var reg = fixtures.makeEmptyRegistry();
+    defer reg.deinit(allocator);
+
+    for (entries) |entry| {
+        try fixtures.appendAccount(allocator, &reg, entry.email, entry.alias, null);
+    }
+
+    const active_key = try fixtures.accountKeyForEmailAlloc(allocator, active_email);
+    reg.active_account_key = active_key;
+    reg.active_account_activated_at_ms = std.Io.Timestamp.now(app_runtime.io(), .real).toMilliseconds();
+    try registry.saveRegistry(allocator, codex_home, &reg);
+}
+
+fn makeUsageSnapshot(primary_used_percent: f64, secondary_used_percent: f64) registry.RateLimitSnapshot {
+    return .{
+        .primary = .{
+            .used_percent = primary_used_percent,
+            .window_minutes = 300,
+            .resets_at = future_primary_reset_at,
+        },
+        .secondary = .{
+            .used_percent = secondary_used_percent,
+            .window_minutes = 10080,
+            .resets_at = future_secondary_reset_at,
+        },
+        .credits = null,
+        .plan_type = .pro,
+    };
+}
+
+fn setStoredUsageSnapshotForAccount(
+    allocator: std.mem.Allocator,
+    home_root: []const u8,
+    email: []const u8,
+    snapshot: registry.RateLimitSnapshot,
+    last_usage_at: i64,
+    active_account_activated_at_ms: i64,
+) !void {
+    const codex_home = try codexHomeAlloc(allocator, home_root);
+    defer allocator.free(codex_home);
+
+    var reg = try registry.loadRegistry(allocator, codex_home);
+    defer reg.deinit(allocator);
+
+    const account_key = try fixtures.accountKeyForEmailAlloc(allocator, email);
+    defer allocator.free(account_key);
+    registry.updateUsage(allocator, &reg, account_key, snapshot);
+    const idx = registry.findAccountIndexByAccountKey(&reg, account_key) orelse return error.TestExpectedEqual;
+    reg.accounts.items[idx].last_usage_at = last_usage_at;
+    reg.active_account_activated_at_ms = active_account_activated_at_ms;
+    try registry.saveRegistry(allocator, codex_home, &reg);
+}
+
+fn writeLocalRolloutUsage(
+    dir: fs.Dir,
+    rel_path: []const u8,
+    primary_used_percent: f64,
+    secondary_used_percent: f64,
+) !void {
+    const contents = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2025-01-01T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"rate_limits\":{{\"primary\":{{\"used_percent\":{d:.1},\"window_minutes\":300,\"resets_at\":{d}}},\"secondary\":{{\"used_percent\":{d:.1},\"window_minutes\":10080,\"resets_at\":{d}}},\"plan_type\":\"pro\"}}}}}}\n",
+        .{
+            primary_used_percent,
+            future_primary_reset_at,
+            secondary_used_percent,
+            future_secondary_reset_at,
+        },
+    );
+    defer std.testing.allocator.free(contents);
+    try dir.writeFile(.{ .sub_path = rel_path, .data = contents });
+}
+
+fn appendCustomAccount(
+    allocator: std.mem.Allocator,
+    reg: *registry.Registry,
+    record_key: []const u8,
+    email: []const u8,
+    alias: []const u8,
+    plan: registry.PlanType,
+) !void {
+    const sep = std.mem.lastIndexOf(u8, record_key, "::") orelse return error.InvalidRecordKey;
+    const chatgpt_user_id = record_key[0..sep];
+    const chatgpt_account_id = record_key[sep + 2 ..];
+    try reg.accounts.append(allocator, .{
+        .account_key = try allocator.dupe(u8, record_key),
+        .chatgpt_account_id = try allocator.dupe(u8, chatgpt_account_id),
+        .chatgpt_user_id = try allocator.dupe(u8, chatgpt_user_id),
+        .email = try allocator.dupe(u8, email),
+        .alias = try allocator.dupe(u8, alias),
+        .account_name = null,
+        .plan = plan,
+        .auth_mode = .chatgpt,
+        .created_at = std.Io.Timestamp.now(app_runtime.io(), .real).toSeconds(),
+        .last_used_at = null,
+        .last_usage = null,
+        .last_usage_at = null,
+        .last_local_rollout = null,
+    });
+}
+
+test "Scenario: Given device auth login when running login then it forwards the flag and imports the current account" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try tmp.dir.makePath("fake-bin");
+
+    const expected_email = "device-auth@example.com";
+    const fake_auth = try fixtures.authJsonWithEmailPlan(gpa, expected_email, "plus");
+    defer gpa.free(fake_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "fake-auth.json", .data = fake_auth });
+    try writeSuccessfulFakeCodex(tmp.dir);
+
+    const fake_bin_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
+    defer gpa.free(fake_bin_path);
+    const path_override = try prependPathEntryAlloc(gpa, fake_bin_path);
+    defer gpa.free(path_override);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "login", "--device-auth" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    const argv_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-codex-argv.txt" });
+    defer gpa.free(argv_path);
+    const argv_data = try fixtures.readFileAlloc(gpa, argv_path);
+    defer gpa.free(argv_data);
+    try std.testing.expect(std.mem.indexOf(u8, argv_data, "login --device-auth") != null);
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+
+    const fake_codex_home_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-codex-home.txt" });
+    defer gpa.free(fake_codex_home_path);
+    const fake_codex_home_data = try fixtures.readFileAlloc(gpa, fake_codex_home_path);
+    defer gpa.free(fake_codex_home_data);
+    const fake_codex_home = std.mem.trim(u8, fake_codex_home_data, " \r\n");
+    try std.testing.expect(!std.mem.eql(u8, fake_codex_home, codex_home));
+    try std.testing.expect(std.mem.indexOf(u8, fake_codex_home, "login-") != null);
+    try std.testing.expectError(error.FileNotFound, fs.cwd().access(fake_codex_home, .{}));
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(loaded.active_account_key != null);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, expected_email));
+
+    const expected_account_key = try fixtures.accountKeyForEmailAlloc(gpa, expected_email);
+    defer gpa.free(expected_account_key);
+    try std.testing.expect(std.mem.eql(u8, loaded.active_account_key.?, expected_account_key));
+
+    const snapshot_path = try registry.accountAuthPath(gpa, codex_home, expected_account_key);
+    defer gpa.free(snapshot_path);
+    const snapshot_data = try fixtures.readFileAlloc(gpa, snapshot_path);
+    defer gpa.free(snapshot_data);
+    try std.testing.expectEqualStrings(fake_auth, snapshot_data);
+
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+    const active_auth = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(active_auth);
+    try std.testing.expectEqualStrings(fake_auth, active_auth);
+}
+
+test "Scenario: Given strict codex login when running login then scratch CODEX_HOME exists before launch" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try tmp.dir.makePath("fake-bin");
+
+    const expected_email = "strict-login@example.com";
+    const fake_auth = try fixtures.authJsonWithEmailPlan(gpa, expected_email, "plus");
+    defer gpa.free(fake_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "fake-auth.json", .data = fake_auth });
+    try writeStrictExistingCodexHomeFakeCodex(tmp.dir);
+
+    const fake_bin_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
+    defer gpa.free(fake_bin_path);
+    const path_override = try prependPathEntryAlloc(gpa, fake_bin_path);
+    defer gpa.free(path_override);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "login", "--device-auth" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+
+    const fake_codex_home_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-codex-home.txt" });
+    defer gpa.free(fake_codex_home_path);
+    const fake_codex_home_data = try fixtures.readFileAlloc(gpa, fake_codex_home_path);
+    defer gpa.free(fake_codex_home_data);
+    const fake_codex_home = std.mem.trim(u8, fake_codex_home_data, " \r\n");
+    try std.testing.expect(!std.mem.eql(u8, fake_codex_home, codex_home));
+    try std.testing.expect(std.mem.indexOf(u8, fake_codex_home, "login-") != null);
+    try std.testing.expectError(error.FileNotFound, fs.cwd().access(fake_codex_home, .{}));
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, expected_email));
+}
+
+test "Scenario: Given npm-style Windows codex wrappers when running login then the bare script is ignored and codex.cmd is launched" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try tmp.dir.makePath("fake-bin");
+
+    const expected_email = "windows-cmd@example.com";
+    const fake_auth = try fixtures.authJsonWithEmailPlan(gpa, expected_email, "plus");
+    defer gpa.free(fake_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "fake-auth.json", .data = fake_auth });
+    try writeBrokenBareWindowsCodex(tmp.dir);
+    try writeStrictExistingCodexHomeFakeCodex(tmp.dir);
+
+    const fake_bin_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
+    defer gpa.free(fake_bin_path);
+    const path_override = try prependPathEntryAlloc(gpa, fake_bin_path);
+    defer gpa.free(path_override);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "login", "--device-auth" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+
+    const launcher_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-codex-launcher.txt" });
+    defer gpa.free(launcher_path);
+    const launcher_data = try fixtures.readFileAlloc(gpa, launcher_path);
+    defer gpa.free(launcher_data);
+    try std.testing.expectEqualStrings("cmd", std.mem.trim(u8, launcher_data, " \r\n"));
+}
+
+test "Scenario: Given only a Windows batch codex wrapper when running login then codex.bat is launched" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try tmp.dir.makePath("fake-bin");
+
+    const expected_email = "windows-bat@example.com";
+    const fake_auth = try fixtures.authJsonWithEmailPlan(gpa, expected_email, "plus");
+    defer gpa.free(fake_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "fake-auth.json", .data = fake_auth });
+    try writeBrokenBareWindowsCodex(tmp.dir);
+    try writeStrictExistingCodexHomeFakeCodexBatch(tmp.dir);
+
+    const fake_bin_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
+    defer gpa.free(fake_bin_path);
+    const path_override = try prependPathEntryAlloc(gpa, fake_bin_path);
+    defer gpa.free(path_override);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "login", "--device-auth" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+
+    const launcher_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-codex-launcher.txt" });
+    defer gpa.free(launcher_path);
+    const launcher_data = try fixtures.readFileAlloc(gpa, launcher_path);
+    defer gpa.free(launcher_data);
+    try std.testing.expectEqualStrings("bat", std.mem.trim(u8, launcher_data, " \r\n"));
+}
+
+test "Scenario: Given only a PowerShell Windows codex wrapper when running login then codex.ps1 is launched" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try tmp.dir.makePath("fake-bin");
+
+    const expected_email = "windows-ps1@example.com";
+    const fake_auth = try fixtures.authJsonWithEmailPlan(gpa, expected_email, "plus");
+    defer gpa.free(fake_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "fake-auth.json", .data = fake_auth });
+    try writeBrokenBareWindowsCodex(tmp.dir);
+    try writeSuccessfulFakeCodexPowerShell(tmp.dir);
+
+    const fake_bin_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
+    defer gpa.free(fake_bin_path);
+    const path_override = try prependPathEntryAlloc(gpa, fake_bin_path);
+    defer gpa.free(path_override);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "login", "--device-auth" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+
+    const launcher_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-codex-launcher.txt" });
+    defer gpa.free(launcher_path);
+    const launcher_data = try fixtures.readFileAlloc(gpa, launcher_path);
+    defer gpa.free(launcher_data);
+    try std.testing.expectEqualStrings("ps1", std.mem.trim(u8, launcher_data, " \r\n"));
+}
+
+test "Scenario: Given a winget-style Windows codex launcher when running login then codex.exe is launched" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try tmp.dir.makePath("fake-bin");
+
+    const expected_email = "windows-exe@example.com";
+    const fake_auth = try fixtures.authJsonWithEmailPlan(gpa, expected_email, "plus");
+    defer gpa.free(fake_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "fake-auth.json", .data = fake_auth });
+    try writeSuccessfulFakeCodexExe(gpa, tmp.dir, project_root);
+
+    const fake_bin_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
+    defer gpa.free(fake_bin_path);
+    const path_override = try prependPathEntryAlloc(gpa, fake_bin_path);
+    defer gpa.free(path_override);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "login", "--device-auth" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+
+    const launcher_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-codex-launcher.txt" });
+    defer gpa.free(launcher_path);
+    const launcher_data = try fixtures.readFileAlloc(gpa, launcher_path);
+    defer gpa.free(launcher_data);
+    try std.testing.expectEqualStrings("exe", std.mem.trim(u8, launcher_data, " \r\n"));
+}
+
+test "Scenario: Given an earlier PowerShell launcher and a later exe launcher when running login then ps1 stays a global fallback" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try tmp.dir.makePath("ps1-bin");
+    try tmp.dir.makePath("exe-bin");
+
+    const expected_email = "windows-ps1-first@example.com";
+    const fake_auth = try fixtures.authJsonWithEmailPlan(gpa, expected_email, "plus");
+    defer gpa.free(fake_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "fake-auth.json", .data = fake_auth });
+    try tmp.dir.writeFile(.{ .sub_path = "ps1-bin/codex", .data = "#!/bin/sh\nexit 99\n" });
+
+    try writeSuccessfulFakeCodexPowerShellAt(tmp.dir, "ps1-bin/codex.ps1");
+    try writeSuccessfulFakeCodexExeAt(gpa, tmp.dir, project_root, "exe-bin/codex.exe");
+
+    const ps1_bin_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "ps1-bin" });
+    defer gpa.free(ps1_bin_path);
+    const exe_bin_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "exe-bin" });
+    defer gpa.free(exe_bin_path);
+    const exe_then_inherited_path = try prependPathEntryAlloc(gpa, exe_bin_path);
+    defer gpa.free(exe_then_inherited_path);
+    const path_override = try std.fmt.allocPrint(gpa, "{s}{c}{s}", .{
+        ps1_bin_path,
+        fs.path.delimiter,
+        exe_then_inherited_path,
+    });
+    defer gpa.free(path_override);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "login", "--device-auth" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+
+    const launcher_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-codex-launcher.txt" });
+    defer gpa.free(launcher_path);
+    const launcher_data = try fixtures.readFileAlloc(gpa, launcher_path);
+    defer gpa.free(launcher_data);
+    try std.testing.expectEqualStrings("exe", std.mem.trim(u8, launcher_data, " \r\n"));
+}
+
+test "Scenario: Given refreshed active auth before login when running login then old account snapshot is synced first" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex/accounts");
+    try tmp.dir.makePath("fake-bin");
+
+    const old_email = "old-active@example.com";
+    const stale_old_auth = try fixtures.authJsonWithEmailPlan(gpa, old_email, "plus");
+    defer gpa.free(stale_old_auth);
+    const fresh_old_auth = try std.mem.replaceOwned(u8, gpa, stale_old_auth, "access-old-active@example.com", "fresh-old-active-token");
+    defer gpa.free(fresh_old_auth);
+
+    const old_key = try fixtures.accountKeyForEmailAlloc(gpa, old_email);
+    defer gpa.free(old_key);
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const old_snapshot_path = try registry.accountAuthPath(gpa, codex_home, old_key);
+    defer gpa.free(old_snapshot_path);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = fresh_old_auth });
+    try fs.cwd().writeFile(.{ .sub_path = old_snapshot_path, .data = stale_old_auth });
+
+    var reg = fixtures.makeEmptyRegistry();
+    defer reg.deinit(gpa);
+    try fixtures.appendAccount(gpa, &reg, old_email, "old", .plus);
+    reg.active_account_key = try gpa.dupe(u8, old_key);
+    reg.active_account_activated_at_ms = std.Io.Timestamp.now(app_runtime.io(), .real).toMilliseconds();
+    try registry.saveRegistry(gpa, codex_home, &reg);
+
+    const new_email = "new-login@example.com";
+    const new_auth = try fixtures.authJsonWithEmailPlan(gpa, new_email, "team");
+    defer gpa.free(new_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "fake-auth.json", .data = new_auth });
+    try writeSuccessfulFakeCodex(tmp.dir);
+
+    const fake_bin_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
+    defer gpa.free(fake_bin_path);
+    const path_override = try prependPathEntryAlloc(gpa, fake_bin_path);
+    defer gpa.free(path_override);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "login", "--device-auth" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+
+    const synced_old_snapshot = try fixtures.readFileAlloc(gpa, old_snapshot_path);
+    defer gpa.free(synced_old_snapshot);
+    try std.testing.expectEqualStrings(fresh_old_auth, synced_old_snapshot);
+}
+
+test "Scenario: Given CODEX_HOME override when running login then it stores auth state under the override root" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath("custom-codex");
+    try tmp.dir.makePath("fake-bin");
+
+    const custom_codex_home = try tmp.dir.realpathAlloc(gpa, "custom-codex");
+    defer gpa.free(custom_codex_home);
+
+    const expected_email = "override@example.com";
+    const fake_auth = try fixtures.authJsonWithEmailPlan(gpa, expected_email, "plus");
+    defer gpa.free(fake_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "fake-auth.json", .data = fake_auth });
+    try writeSuccessfulFakeCodex(tmp.dir);
+
+    const fake_bin_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
+    defer gpa.free(fake_bin_path);
+    const path_override = try prependPathEntryAlloc(gpa, fake_bin_path);
+    defer gpa.free(path_override);
+
+    const result = try runCliWithIsolatedHomeAndCodexHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        custom_codex_home,
+        path_override,
+        &[_][]const u8{ "login", "--device-auth" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+
+    const custom_auth_path = try registry.activeAuthPath(gpa, custom_codex_home);
+    defer gpa.free(custom_auth_path);
+    try fs.cwd().access(custom_auth_path, .{});
+
+    const fake_codex_home_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-codex-home.txt" });
+    defer gpa.free(fake_codex_home_path);
+    const fake_codex_home_data = try fixtures.readFileAlloc(gpa, fake_codex_home_path);
+    defer gpa.free(fake_codex_home_data);
+    const fake_codex_home = std.mem.trim(u8, fake_codex_home_data, " \r\n");
+    try std.testing.expect(!std.mem.eql(u8, fake_codex_home, custom_codex_home));
+    try std.testing.expect(std.mem.indexOf(u8, fake_codex_home, "login-") != null);
+
+    const default_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(default_auth_path);
+    try std.testing.expectError(error.FileNotFound, fs.cwd().access(default_auth_path, .{}));
+
+    var loaded = try registry.loadRegistry(gpa, custom_codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, expected_email));
+}
+
+test "Scenario: Given failed device auth login with existing auth json when running login then it forwards the flag and does not mutate the registry" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try tmp.dir.makePath("fake-bin");
+
+    const existing_auth = try fixtures.authJsonWithEmailPlan(gpa, "existing@example.com", "plus");
+    defer gpa.free(existing_auth);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = existing_auth });
+    try writeFailingFakeCodex(tmp.dir, 9);
+
+    const fake_bin_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-bin" });
+    defer gpa.free(fake_bin_path);
+    const path_override = try prependPathEntryAlloc(gpa, fake_bin_path);
+    defer gpa.free(path_override);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "login", "--device-auth" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    const argv_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "fake-codex-argv.txt" });
+    defer gpa.free(argv_path);
+    const argv_data = try fixtures.readFileAlloc(gpa, argv_path);
+    defer gpa.free(argv_data);
+    try std.testing.expect(std.mem.indexOf(u8, argv_data, "login --device-auth") != null);
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(".codex/accounts/registry.json", .{}));
+
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+    const active_auth = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(active_auth);
+    try std.testing.expectEqualStrings(existing_auth, active_auth);
+}
+
+// This simulates first-time use on v0.2 when ~/.codex/auth.json already exists
+// but ~/.codex/accounts has not been created yet.
+test "Scenario: Given first-time use on v0.2 with an existing auth.json and no accounts directory when list runs then cli auto-imports and stays usable" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    try writeFailingFakeCurl(gpa, tmp.dir, project_root);
+    const fake_curl_dir = try tmp.dir.realpathAlloc(gpa, "fake-curl-bin");
+    defer gpa.free(fake_curl_dir);
+    const path_override = try prependPathEntryAlloc(gpa, fake_curl_dir);
+    defer gpa.free(path_override);
+
+    const email = "fresh@example.com";
+    const auth_json = try fixtures.authJsonWithEmailPlan(gpa, email, "plus");
+    defer gpa.free(auth_json);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = auth_json });
+
+    const result = try runCliWithIsolatedHomeAndPath(gpa, project_root, home_root, path_override, &[_][]const u8{"list"});
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, email) != null);
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(loaded.active_account_key != null);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, email));
+
+    const expected_account_id = try fixtures.accountKeyForEmailAlloc(gpa, email);
+    defer gpa.free(expected_account_id);
+    try std.testing.expect(std.mem.eql(u8, loaded.active_account_key.?, expected_account_id));
+
+    const snapshot_path = try registry.accountAuthPath(gpa, codex_home, expected_account_id);
+    defer gpa.free(snapshot_path);
+    const snapshot_data = try fixtures.readFileAlloc(gpa, snapshot_path);
+    defer gpa.free(snapshot_data);
+
+    const auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(auth_path);
+    const active_data = try fixtures.readFileAlloc(gpa, auth_path);
+    defer gpa.free(active_data);
+    try std.testing.expect(std.mem.eql(u8, snapshot_data, active_data));
+}
+
+// This simulates a real v0.1.x -> v0.2 upgrade:
+// the old email-keyed registry and snapshot exist under ~/.codex/accounts before the new binary runs.
+test "Scenario: Given upgrade from v0.1.x to v0.2 with legacy accounts data when list runs then cli migrates registry and keeps account usable" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex/accounts");
+    try writeFailingFakeCurl(gpa, tmp.dir, project_root);
+    const fake_curl_dir = try tmp.dir.realpathAlloc(gpa, "fake-curl-bin");
+    defer gpa.free(fake_curl_dir);
+    const path_override = try prependPathEntryAlloc(gpa, fake_curl_dir);
+    defer gpa.free(path_override);
+
+    const email = "legacy@example.com";
+    const auth_json = try fixtures.authJsonWithEmailPlan(gpa, email, "team");
+    defer gpa.free(auth_json);
+
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = auth_json });
+
+    const legacy_name = try legacySnapshotNameForEmail(gpa, email);
+    defer gpa.free(legacy_name);
+    const legacy_rel = try fs.path.join(gpa, &[_][]const u8{ ".codex", "accounts", legacy_name });
+    defer gpa.free(legacy_rel);
+    try tmp.dir.writeFile(.{ .sub_path = legacy_rel, .data = auth_json });
+
+    try tmp.dir.writeFile(.{
+        .sub_path = ".codex/accounts/registry.json",
+        .data =
+        \\{
+        \\  "version": 2,
+        \\  "active_email": "legacy@example.com",
+        \\  "accounts": [
+        \\    {
+        \\      "email": "legacy@example.com",
+        \\      "alias": "legacy",
+        \\      "plan": "team",
+        \\      "auth_mode": "chatgpt",
+        \\      "created_at": 1,
+        \\      "last_used_at": 2,
+        \\      "last_usage_at": 3
+        \\    }
+        \\  ]
+        \\}
+        ,
+    });
+
+    const result = try runCliWithIsolatedHomeAndPath(gpa, project_root, home_root, path_override, &[_][]const u8{"list"});
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.stdout, email) != null or
+            std.mem.indexOf(u8, result.stdout, "legacy") != null,
+    );
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, registry.current_schema_version), loaded.schema_version);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(loaded.active_account_key != null);
+
+    const expected_account_id = try fixtures.accountKeyForEmailAlloc(gpa, email);
+    defer gpa.free(expected_account_id);
+    try std.testing.expect(std.mem.eql(u8, loaded.active_account_key.?, expected_account_id));
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].account_key, expected_account_id));
+
+    const migrated_path = try registry.accountAuthPath(gpa, codex_home, expected_account_id);
+    defer gpa.free(migrated_path);
+    var migrated = try fs.cwd().openFile(migrated_path, .{});
+    migrated.close();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(legacy_rel, .{}));
+}
+
+test "Scenario: Given repeated single-file import when running import then first import reports imported and second reports updated" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath("imports");
+
+    const rel_path = "imports/token_ryan.taylor.alpha@email.com.json";
+    const auth_json = try fixtures.authJsonWithEmailPlan(gpa, "ryan.taylor.alpha@email.com", "plus");
+    defer gpa.free(auth_json);
+    try tmp.dir.writeFile(.{ .sub_path = rel_path, .data = auth_json });
+
+    const import_path = try fs.path.join(gpa, &[_][]const u8{ home_root, rel_path });
+    defer gpa.free(import_path);
+
+    const first = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", import_path });
+    defer gpa.free(first.stdout);
+    defer gpa.free(first.stderr);
+    try expectSuccess(first);
+    try std.testing.expectEqualStrings("  imported  token_ryan.taylor.alpha@email.com.json\n", first.stdout);
+    try std.testing.expectEqualStrings("", first.stderr);
+
+    const second = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", import_path });
+    defer gpa.free(second.stdout);
+    defer gpa.free(second.stderr);
+    try expectSuccess(second);
+    try std.testing.expectEqualStrings("  updated   token_ryan.taylor.alpha@email.com.json\n", second.stdout);
+    try std.testing.expectEqualStrings("", second.stderr);
+}
+
+test "Scenario: Given API key import when listing with api refresh then stale snapshots do not render MissingAuth" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath("imports");
+    try writeApiKeyFlowFakeCurl(gpa, tmp.dir, project_root);
+
+    const fake_curl_dir = try tmp.dir.realpathAlloc(gpa, "fake-curl-bin");
+    defer gpa.free(fake_curl_dir);
+    const path_override = try prependPathEntryAlloc(gpa, fake_curl_dir);
+    defer gpa.free(path_override);
+
+    const api_key = "sk-e2e-api-key-flow";
+    try tmp.dir.writeFile(.{
+        .sub_path = "imports/api-key.json",
+        .data = "{\"OPENAI_API_KEY\":\"sk-e2e-api-key-flow\"}",
+    });
+    const import_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "imports", "api-key.json" });
+    defer gpa.free(import_path);
+
+    const import_result = try runCliWithIsolatedHomeAndPathAndApiKeyCurl(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "import", import_path },
+    );
+    defer gpa.free(import_result.stdout);
+    defer gpa.free(import_result.stderr);
+
+    logRunResultIfFailed("api key import", import_result);
+    try expectSuccess(import_result);
+    try std.testing.expect(std.mem.indexOf(u8, import_result.stdout, "imported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, import_result.stdout, "api-key") != null);
+    try std.testing.expectEqualStrings("", import_result.stderr);
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expectEqual(registry.AuthMode.apikey, loaded.accounts.items[0].auth_mode.?);
+    try std.testing.expectEqualStrings("apikey-flow@example.com", loaded.accounts.items[0].email);
+    const api_account_key = try gpa.dupe(u8, loaded.accounts.items[0].account_key);
+    defer gpa.free(api_account_key);
+
+    const api_snapshot_path = try registry.accountAuthPath(gpa, codex_home, api_account_key);
+    defer gpa.free(api_snapshot_path);
+    const api_snapshot = try fixtures.readFileAlloc(gpa, api_snapshot_path);
+    defer gpa.free(api_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, api_snapshot, api_key) != null);
+
+    const registry_path = try fs.path.join(gpa, &[_][]const u8{ codex_home, "accounts", "registry.json" });
+    defer gpa.free(registry_path);
+    const registry_data = try fixtures.readFileAlloc(gpa, registry_path);
+    defer gpa.free(registry_data);
+    try std.testing.expect(std.mem.indexOf(u8, registry_data, api_key) == null);
+
+    registry.updateUsage(gpa, &loaded, api_account_key, makeUsageSnapshot(88, 66));
+    const api_idx = registry.findAccountIndexByAccountKey(&loaded, api_account_key) orelse return error.TestExpectedEqual;
+    loaded.accounts.items[api_idx].last_usage_at = 1;
+
+    const chatgpt_email = "chatgpt-flow@example.com";
+    try fixtures.appendAccount(gpa, &loaded, chatgpt_email, "chatgpt", .plus);
+    const chatgpt_key = try fixtures.accountKeyForEmailAlloc(gpa, chatgpt_email);
+    defer gpa.free(chatgpt_key);
+    const chatgpt_snapshot_path = try registry.accountAuthPath(gpa, codex_home, chatgpt_key);
+    defer gpa.free(chatgpt_snapshot_path);
+    const chatgpt_auth = try fixtures.authJsonWithEmailPlan(gpa, chatgpt_email, "plus");
+    defer gpa.free(chatgpt_auth);
+    try registry.ensureAccountsDir(gpa, codex_home);
+    try fs.cwd().writeFile(.{ .sub_path = chatgpt_snapshot_path, .data = chatgpt_auth });
+    try registry.saveRegistry(gpa, codex_home, &loaded);
+
+    const first_list = try runCliWithIsolatedHomeAndPathAndApiKeyCurl(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "list", "--api" },
+    );
+    defer gpa.free(first_list.stdout);
+    defer gpa.free(first_list.stderr);
+
+    logRunResultIfFailed("api key list before stale snapshot", first_list);
+    try expectSuccess(first_list);
+    try std.testing.expect(std.mem.indexOf(u8, first_list.stdout, "apikey-flow@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_list.stdout, "chatgpt-flow@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_list.stdout, "API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_list.stdout, "MissingAuth") == null);
+    try std.testing.expectEqualStrings("", first_list.stderr);
+
+    var refreshed = try registry.loadRegistry(gpa, codex_home);
+    defer refreshed.deinit(gpa);
+    const refreshed_api_idx = registry.findAccountIndexByAccountKey(&refreshed, api_account_key) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(f64, 88), refreshed.accounts.items[refreshed_api_idx].last_usage.?.primary.?.used_percent);
+    try std.testing.expectEqual(@as(f64, 66), refreshed.accounts.items[refreshed_api_idx].last_usage.?.secondary.?.used_percent);
+    const chatgpt_idx = registry.findAccountIndexByAccountKey(&refreshed, chatgpt_key) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(f64, 12), refreshed.accounts.items[chatgpt_idx].last_usage.?.primary.?.used_percent);
+    try std.testing.expectEqual(@as(f64, 34), refreshed.accounts.items[chatgpt_idx].last_usage.?.secondary.?.used_percent);
+
+    try fs.cwd().writeFile(.{ .sub_path = api_snapshot_path, .data = "{}" });
+
+    const second_list = try runCliWithIsolatedHomeAndPathAndApiKeyCurl(
+        gpa,
+        project_root,
+        home_root,
+        path_override,
+        &[_][]const u8{ "list", "--api" },
+    );
+    defer gpa.free(second_list.stdout);
+    defer gpa.free(second_list.stderr);
+
+    logRunResultIfFailed("api key list after stale snapshot", second_list);
+    try expectSuccess(second_list);
+    try std.testing.expect(std.mem.indexOf(u8, second_list.stdout, "apikey-flow@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_list.stdout, "API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_list.stdout, "MissingAuth") == null);
+    try std.testing.expectEqualStrings("", second_list.stderr);
+
+    var refreshed_again = try registry.loadRegistry(gpa, codex_home);
+    defer refreshed_again.deinit(gpa);
+    const refreshed_again_api_idx = registry.findAccountIndexByAccountKey(&refreshed_again, api_account_key) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(f64, 88), refreshed_again.accounts.items[refreshed_again_api_idx].last_usage.?.primary.?.used_percent);
+    try std.testing.expectEqual(@as(f64, 66), refreshed_again.accounts.items[refreshed_again_api_idx].last_usage.?.secondary.?.used_percent);
+}
+
+test "Scenario: Given single-file import missing email when running import then it exits non-zero after reporting the skipped file" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath("imports");
+
+    const rel_path = "imports/token_bob.wilson.alpha@email.com.json";
+    const auth_json = try fixtures.authJsonWithoutEmail(gpa);
+    defer gpa.free(auth_json);
+    try tmp.dir.writeFile(.{ .sub_path = rel_path, .data = auth_json });
+
+    const import_path = try fs.path.join(gpa, &[_][]const u8{ home_root, rel_path });
+    defer gpa.free(import_path);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", import_path });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("Import Summary: 0 imported, 1 skipped\n", result.stdout);
+    const expected_stderr = try std.fmt.allocPrint(
+        gpa,
+        "  skipped   token_bob.wilson.alpha@email.com.json: MissingEmail\n",
+        .{},
+    );
+    defer gpa.free(expected_stderr);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, expected_stderr) != null);
+}
+
+test "Scenario: Given purge with no recoverable active auth when running import then it activates the first rebuilt account and backs up auth json" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex/accounts");
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+
+    const zed_auth = try fixtures.authJsonWithEmailPlan(gpa, "zed@example.com", "team");
+    defer gpa.free(zed_auth);
+    const zed_key = try fixtures.accountKeyForEmailAlloc(gpa, "zed@example.com");
+    defer gpa.free(zed_key);
+    const zed_snapshot_path = try registry.accountAuthPath(gpa, codex_home, zed_key);
+    defer gpa.free(zed_snapshot_path);
+    try fs.cwd().writeFile(.{ .sub_path = zed_snapshot_path, .data = zed_auth });
+
+    const alpha_auth = try fixtures.authJsonWithEmailPlan(gpa, "alpha@example.com", "plus");
+    defer gpa.free(alpha_auth);
+    const alpha_key = try fixtures.accountKeyForEmailAlloc(gpa, "alpha@example.com");
+    defer gpa.free(alpha_key);
+    const alpha_snapshot_path = try registry.accountAuthPath(gpa, codex_home, alpha_key);
+    defer gpa.free(alpha_snapshot_path);
+    try fs.cwd().writeFile(.{ .sub_path = alpha_snapshot_path, .data = alpha_auth });
+
+    const stale_auth = "{\"broken\":true}";
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = stale_auth });
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", "--purge" });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Import Summary: 2 imported, 0 updated, 0 skipped (total 2 files)\n") != null);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+    const active_auth = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(active_auth);
+    try std.testing.expectEqualStrings(alpha_auth, active_auth);
+
+    try std.testing.expectEqual(@as(usize, 1), try countAuthBackups(tmp.dir, ".codex/accounts"));
+
+    var backup_name: ?[]u8 = null;
+    defer if (backup_name) |name| gpa.free(name);
+
+    var accounts = try tmp.dir.openDir(".codex/accounts", .{ .iterate = true });
+    defer accounts.close();
+    var it = accounts.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, "auth.json.bak.")) continue;
+        backup_name = try gpa.dupe(u8, entry.name);
+        break;
+    }
+    try std.testing.expect(backup_name != null);
+
+    const backup_rel = try fs.path.join(gpa, &[_][]const u8{ ".codex", "accounts", backup_name.? });
+    defer gpa.free(backup_rel);
+    var backup_file = try tmp.dir.openFile(backup_rel, .{});
+    defer backup_file.close();
+    const backup_contents = try backup_file.readToEndAlloc(gpa, 10 * 1024 * 1024);
+    defer gpa.free(backup_contents);
+    try std.testing.expectEqualStrings(stale_auth, backup_contents);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expect(loaded.active_account_key != null);
+    try std.testing.expect(std.mem.eql(u8, loaded.active_account_key.?, alpha_key));
+}
+
+test "Scenario: Given directory import with new updated and invalid files when running import then stdout and stderr split the report" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath("imports");
+
+    const existing_rel = "imports/token_jane.smith.alpha@email.com.json";
+    const existing_auth = try fixtures.authJsonWithEmailPlan(gpa, "jane.smith.alpha@email.com", "team");
+    defer gpa.free(existing_auth);
+    try tmp.dir.writeFile(.{ .sub_path = existing_rel, .data = existing_auth });
+
+    const existing_path = try fs.path.join(gpa, &[_][]const u8{ home_root, existing_rel });
+    defer gpa.free(existing_path);
+
+    const seed_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", existing_path });
+    defer gpa.free(seed_result.stdout);
+    defer gpa.free(seed_result.stderr);
+    try expectSuccess(seed_result);
+
+    const ryan_auth = try fixtures.authJsonWithEmailPlan(gpa, "ryan.taylor.alpha@email.com", "plus");
+    defer gpa.free(ryan_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/token_ryan.taylor.alpha@email.com.json", .data = ryan_auth });
+
+    const john_auth = try fixtures.authJsonWithEmailPlan(gpa, "john.doe.alpha@email.com", "pro");
+    defer gpa.free(john_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/token_john.doe.alpha@email.com.json", .data = john_auth });
+
+    const extra_auth = try fixtures.authJsonWithEmailPlan(gpa, "mike.roe.alpha@email.com", "business");
+    defer gpa.free(extra_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/token_mike.roe.alpha@email.com.json", .data = extra_auth });
+
+    const missing_email = try fixtures.authJsonWithoutEmail(gpa);
+    defer gpa.free(missing_email);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/token_bob.wilson.alpha@email.com.json", .data = missing_email });
+
+    const missing_user_id =
+        "{\"tokens\":{\"access_token\":\"access-missing-user\",\"account_id\":\"67000000-0000-4000-8000-000000000001\",\"id_token\":\"eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6ImFsaWNlLmJyb3duLmFscGhhQGVtYWlsLmNvbSIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X2FjY291bnRfaWQiOiI2NzAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDEiLCJjaGF0Z3B0X3BsYW5fdHlwZSI6InBybyJ9fQ.sig\"}}";
+    try tmp.dir.writeFile(.{ .sub_path = "imports/token_alice.brown.alpha@email.com.json", .data = missing_user_id });
+
+    try tmp.dir.writeFile(.{ .sub_path = "imports/token_invalid.json", .data = "{not-json}" });
+
+    const imports_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "imports" });
+    defer gpa.free(imports_path);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", imports_path });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    const expected_stdout = try std.fmt.allocPrint(
+        gpa,
+        "Scanning {s}...\n" ++
+            "  updated   token_jane.smith.alpha@email.com.json\n" ++
+            "  imported  token_john.doe.alpha@email.com.json\n" ++
+            "  imported  token_mike.roe.alpha@email.com.json\n" ++
+            "  imported  token_ryan.taylor.alpha@email.com.json\n" ++
+            "Import Summary: 3 imported, 1 updated, 3 skipped (total 7 files)\n",
+        .{imports_path},
+    );
+    defer gpa.free(expected_stdout);
+    try std.testing.expectEqualStrings(expected_stdout, result.stdout);
+    const expected_stderr = try std.fmt.allocPrint(
+        gpa,
+        "  skipped   token_alice.brown.alpha@email.com.json: MissingChatgptUserId\n" ++
+            "  skipped   token_bob.wilson.alpha@email.com.json: MissingEmail\n" ++
+            "  skipped   token_invalid.json: InvalidJSON\n",
+        .{},
+    );
+    defer gpa.free(expected_stderr);
+    try std.testing.expectEqualStrings(expected_stderr, result.stderr);
+}
+
+test "Scenario: Given directory import with regular files and array files when running import then array items are grouped" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath("imports");
+
+    const another_auth = try fixtures.authJsonWithEmailPlan(gpa, "another@example.com", "plus");
+    defer gpa.free(another_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/another_token_file.json", .data = another_auth });
+
+    const one_auth = try fixtures.authJsonWithEmailPlan(gpa, "one@example.com", "team");
+    defer gpa.free(one_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/one_token_file.json", .data = one_auth });
+
+    try tmp.dir.writeFile(.{ .sub_path = "imports/token_malformed.json", .data = "{not-json}" });
+
+    const first_array_auth = try fixtures.authJsonWithEmailPlan(gpa, "erin.array@example.com", "plus");
+    defer gpa.free(first_array_auth);
+    const second_array_auth = try fixtures.authJsonWithEmailPlan(gpa, "frank.array@example.com", "team");
+    defer gpa.free(second_array_auth);
+    const array_auth = try std.fmt.allocPrint(gpa, "[{s},{s}]", .{ first_array_auth, second_array_auth });
+    defer gpa.free(array_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/tokens_array.json", .data = array_auth });
+
+    const mixed_valid_auth = try fixtures.authJsonWithEmailPlan(gpa, "grace.array@example.com", "pro");
+    defer gpa.free(mixed_valid_auth);
+    const mixed_invalid_auth = try fixtures.authJsonWithoutEmail(gpa);
+    defer gpa.free(mixed_invalid_auth);
+    const mixed_array_auth = try std.fmt.allocPrint(gpa, "[{s},{s}]", .{ mixed_valid_auth, mixed_invalid_auth });
+    defer gpa.free(mixed_array_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/tokens_array_mixed.json", .data = mixed_array_auth });
+
+    try tmp.dir.writeFile(.{ .sub_path = "imports/tokens_empty_array.json", .data = "[]" });
+
+    const imports_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "imports" });
+    defer gpa.free(imports_path);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", imports_path });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    const expected_stdout = try std.fmt.allocPrint(
+        gpa,
+        "Scanning {s}...\n" ++
+            "  imported  another_token_file.json\n" ++
+            "  imported  one_token_file.json\n" ++
+            "tokens_array.json:\n" ++
+            "  [1] imported  erin.array@example.com\n" ++
+            "  [2] imported  frank.array@example.com\n" ++
+            "tokens_array_mixed.json:\n" ++
+            "  [1] imported  grace.array@example.com\n" ++
+            "  [2] skipped   MissingEmail\n" ++
+            "Import Summary: 5 imported, 0 updated, 2 skipped (total 6 files)\n",
+        .{imports_path},
+    );
+    defer gpa.free(expected_stdout);
+    try std.testing.expectEqualStrings(expected_stdout, result.stdout);
+    try std.testing.expectEqualStrings(
+        "  skipped   token_malformed.json: InvalidJSON\n",
+        result.stderr,
+    );
+}
+
+test "Scenario: Given directory import with an empty json file when running import then it is skipped as malformed and valid imports still persist" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath("imports");
+
+    const valid_auth = try fixtures.authJsonWithEmailPlan(gpa, "still-imported@example.com", "plus");
+    defer gpa.free(valid_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/valid.json", .data = valid_auth });
+    try tmp.dir.writeFile(.{ .sub_path = "imports/empty.json", .data = "" });
+
+    const imports_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "imports" });
+    defer gpa.free(imports_path);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", imports_path });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    const expected_stdout = try std.fmt.allocPrint(
+        gpa,
+        "Scanning {s}...\n" ++
+            "  imported  valid.json\n" ++
+            "Import Summary: 1 imported, 0 updated, 1 skipped (total 2 files)\n",
+        .{imports_path},
+    );
+    defer gpa.free(expected_stdout);
+    try std.testing.expectEqualStrings(expected_stdout, result.stdout);
+    const expected_stderr = try std.fmt.allocPrint(gpa, "  skipped   empty.json: InvalidJSON\n", .{});
+    defer gpa.free(expected_stderr);
+    try std.testing.expectEqualStrings(expected_stderr, result.stderr);
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, "still-imported@example.com"));
+}
+
+test "Scenario: Given directory import with a broken symlink when running import then it skips that entry and still imports valid files" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath("imports");
+
+    const valid_auth = try fixtures.authJsonWithEmailPlan(gpa, "symlink-survivor@example.com", "plus");
+    defer gpa.free(valid_auth);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/valid.json", .data = valid_auth });
+    try tmp.dir.symLink("missing.json", "imports/broken.json", .{});
+
+    const imports_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "imports" });
+    defer gpa.free(imports_path);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", imports_path });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    const expected_stdout = try std.fmt.allocPrint(
+        gpa,
+        "Scanning {s}...\n" ++
+            "  imported  valid.json\n" ++
+            "Import Summary: 1 imported, 0 updated, 1 skipped (total 2 files)\n",
+        .{imports_path},
+    );
+    defer gpa.free(expected_stdout);
+    try std.testing.expectEqualStrings(expected_stdout, result.stdout);
+    const expected_stderr = try std.fmt.allocPrint(gpa, "  skipped   broken.json: FileNotFound\n", .{});
+    defer gpa.free(expected_stderr);
+    try std.testing.expectEqualStrings(expected_stderr, result.stderr);
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, "symlink-survivor@example.com"));
+}
+
+test "Scenario: Given cpa directory in default location when running import cpa then it imports from ~/.cli-proxy-api" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".cli-proxy-api");
+
+    const first = try fixtures.cpaJsonWithEmailPlan(gpa, "default-cpa@example.com", "plus");
+    defer gpa.free(first);
+    const second = try fixtures.cpaJsonWithEmailPlan(gpa, "second-cpa@example.com", "team");
+    defer gpa.free(second);
+    const missing_refresh = try fixtures.cpaJsonWithoutRefreshToken(gpa, "skip-cpa@example.com", "pro");
+    defer gpa.free(missing_refresh);
+    try tmp.dir.writeFile(.{ .sub_path = ".cli-proxy-api/first.json", .data = first });
+    try tmp.dir.writeFile(.{ .sub_path = ".cli-proxy-api/second.json", .data = second });
+    try tmp.dir.writeFile(.{ .sub_path = ".cli-proxy-api/no-refresh.json", .data = missing_refresh });
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", "--cpa" });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    const expected_stdout = try std.fmt.allocPrint(
+        gpa,
+        "Scanning ~/.cli-proxy-api...\n" ++
+            "  imported  first.json\n" ++
+            "  imported  no-refresh.json\n" ++
+            "  imported  second.json\n" ++
+            "Import Summary: 3 imported, 0 updated, 0 skipped (total 3 files)\n",
+        .{},
+    );
+    defer gpa.free(expected_stdout);
+    try std.testing.expectEqualStrings(expected_stdout, result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 3), loaded.accounts.items.len);
+}
+
+test "Scenario: Given missing default cpa directory when running import cpa then it fails" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", "--cpa" });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+}
+
+test "Scenario: Given cpa file import when running import cpa then it stores a standard auth snapshot" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath("imports");
+
+    const cpa_json = try fixtures.cpaJsonWithEmailPlan(gpa, "single-file-cpa@example.com", "business");
+    defer gpa.free(cpa_json);
+    try tmp.dir.writeFile(.{ .sub_path = "imports/cpa.json", .data = cpa_json });
+
+    const import_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "imports", "cpa.json" });
+    defer gpa.free(import_path);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "import", "--cpa", import_path, "--alias", "personal" });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings("  imported  cpa.json\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const account_key = try fixtures.accountKeyForEmailAlloc(gpa, "single-file-cpa@example.com");
+    defer gpa.free(account_key);
+    const snapshot_path = try registry.accountAuthPath(gpa, codex_home, account_key);
+    defer gpa.free(snapshot_path);
+    const snapshot_data = try fixtures.readFileAlloc(gpa, snapshot_path);
+    defer gpa.free(snapshot_data);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_data, "\"tokens\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_data, "\"refresh_token\": \"refresh-single-file-cpa@example.com\"") != null);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].alias, "personal"));
+}
+
+test "Scenario: Given default api usage when rendering help then skip-api note stays in stdout" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{});
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "codex-auth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Usage API:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Account API:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "API-backed refresh is the default") != null);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "Scenario: Given switch query with a direct local match when running switch then it does not require api refresh executables" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+        .{ .email = "backup@example.com", .alias = "backup" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+
+    const active_key = try fixtures.accountKeyForEmailAlloc(gpa, "active@example.com");
+    defer gpa.free(active_key);
+    const backup_key = try fixtures.accountKeyForEmailAlloc(gpa, "backup@example.com");
+    defer gpa.free(backup_key);
+    const active_snapshot_path = try registry.accountAuthPath(gpa, codex_home, active_key);
+    defer gpa.free(active_snapshot_path);
+    const backup_snapshot_path = try registry.accountAuthPath(gpa, codex_home, backup_key);
+    defer gpa.free(backup_snapshot_path);
+
+    const active_auth = try fixtures.authJsonWithEmailPlan(gpa, "active@example.com", "team");
+    defer gpa.free(active_auth);
+    const backup_auth = try fixtures.authJsonWithEmailPlan(gpa, "backup@example.com", "plus");
+    defer gpa.free(backup_auth);
+
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = backup_snapshot_path, .data = backup_auth });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{ "switch", "backup@" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings("Switched to backup(backup@example.com)\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    const auth_after = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(auth_after);
+    try std.testing.expectEqualStrings(backup_auth, auth_after);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expect(loaded.active_account_key != null);
+    try std.testing.expect(loaded.previous_active_account_key != null);
+    try std.testing.expect(std.mem.eql(u8, loaded.active_account_key.?, backup_key));
+    try std.testing.expect(std.mem.eql(u8, loaded.previous_active_account_key.?, active_key));
+}
+
+test "Scenario: Given previous account exists when running top-level dash then it switches back and forth" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+        .{ .email = "backup@example.com", .alias = "backup" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+
+    const active_key = try fixtures.accountKeyForEmailAlloc(gpa, "active@example.com");
+    defer gpa.free(active_key);
+    const backup_key = try fixtures.accountKeyForEmailAlloc(gpa, "backup@example.com");
+    defer gpa.free(backup_key);
+    const active_snapshot_path = try registry.accountAuthPath(gpa, codex_home, active_key);
+    defer gpa.free(active_snapshot_path);
+    const backup_snapshot_path = try registry.accountAuthPath(gpa, codex_home, backup_key);
+    defer gpa.free(backup_snapshot_path);
+
+    const active_auth = try fixtures.authJsonWithEmailPlan(gpa, "active@example.com", "team");
+    defer gpa.free(active_auth);
+    const backup_auth = try fixtures.authJsonWithEmailPlan(gpa, "backup@example.com", "plus");
+    defer gpa.free(backup_auth);
+
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = backup_snapshot_path, .data = backup_auth });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const switch_result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{ "switch", "backup@" },
+    );
+    defer gpa.free(switch_result.stdout);
+    defer gpa.free(switch_result.stderr);
+    try expectSuccess(switch_result);
+
+    const dash_result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{"-"},
+    );
+    defer gpa.free(dash_result.stdout);
+    defer gpa.free(dash_result.stderr);
+    try expectSuccess(dash_result);
+    try std.testing.expectEqualStrings("Switched to active(active@example.com)\n", dash_result.stdout);
+    try std.testing.expectEqualStrings("", dash_result.stderr);
+
+    const auth_after_dash = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(auth_after_dash);
+    try std.testing.expectEqualStrings(active_auth, auth_after_dash);
+
+    var loaded_after_dash = try registry.loadRegistry(gpa, codex_home);
+    defer loaded_after_dash.deinit(gpa);
+    try std.testing.expect(loaded_after_dash.active_account_key != null);
+    try std.testing.expect(loaded_after_dash.previous_active_account_key != null);
+    try std.testing.expectEqualStrings(active_key, loaded_after_dash.active_account_key.?);
+    try std.testing.expectEqualStrings(backup_key, loaded_after_dash.previous_active_account_key.?);
+
+    const switch_dash_result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{ "switch", "-" },
+    );
+    defer gpa.free(switch_dash_result.stdout);
+    defer gpa.free(switch_dash_result.stderr);
+    try expectSuccess(switch_dash_result);
+    try std.testing.expectEqualStrings("Switched to backup(backup@example.com)\n", switch_dash_result.stdout);
+    try std.testing.expectEqualStrings("", switch_dash_result.stderr);
+
+    const auth_after_switch_dash = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(auth_after_switch_dash);
+    try std.testing.expectEqualStrings(backup_auth, auth_after_switch_dash);
+}
+
+test "Scenario: Given no previous account when running dash then it fails cleanly" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+    });
+
+    const result = try runCliWithIsolatedHome(
+        gpa,
+        project_root,
+        home_root,
+        &[_][]const u8{"-"},
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expectEqualStrings("error: no previous account to switch to.\n", result.stderr);
+}
+
+test "Scenario: Given previous is active after remove when running dash then it fails cleanly" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "previous@example.com", .alias = "previous" },
+        .{ .email = "active@example.com", .alias = "active" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+
+    const previous_key = try fixtures.accountKeyForEmailAlloc(gpa, "previous@example.com");
+    defer gpa.free(previous_key);
+    const active_key = try fixtures.accountKeyForEmailAlloc(gpa, "active@example.com");
+    defer gpa.free(active_key);
+    const previous_snapshot_path = try registry.accountAuthPath(gpa, codex_home, previous_key);
+    defer gpa.free(previous_snapshot_path);
+    const active_snapshot_path = try registry.accountAuthPath(gpa, codex_home, active_key);
+    defer gpa.free(active_snapshot_path);
+
+    const previous_auth = try fixtures.authJsonWithEmailPlan(gpa, "previous@example.com", "plus");
+    defer gpa.free(previous_auth);
+    const active_auth = try fixtures.authJsonWithEmailPlan(gpa, "active@example.com", "pro");
+    defer gpa.free(active_auth);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = previous_snapshot_path, .data = previous_auth });
+    try fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
+
+    var seeded = try registry.loadRegistry(gpa, codex_home);
+    defer seeded.deinit(gpa);
+    try registry.setActiveAccountKey(gpa, &seeded, previous_key);
+    try registry.setActiveAccountKey(gpa, &seeded, active_key);
+    try registry.saveRegistry(gpa, codex_home, &seeded);
+
+    const remove_result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "active@" }, "");
+    defer gpa.free(remove_result.stdout);
+    defer gpa.free(remove_result.stderr);
+    try expectSuccess(remove_result);
+
+    const dash_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{"-"});
+    defer gpa.free(dash_result.stdout);
+    defer gpa.free(dash_result.stderr);
+    try expectFailure(dash_result);
+    try std.testing.expectEqualStrings("", dash_result.stdout);
+    try std.testing.expectEqualStrings("error: no previous account to switch to.\n", dash_result.stderr);
+
+    const active_auth_after = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(active_auth_after);
+    try std.testing.expectEqualStrings(previous_auth, active_auth_after);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expect(loaded.active_account_key != null);
+    try std.testing.expect(loaded.previous_active_account_key != null);
+    try std.testing.expectEqualStrings(previous_key, loaded.active_account_key.?);
+    try std.testing.expectEqualStrings(previous_key, loaded.previous_active_account_key.?);
+}
+
+test "Scenario: Given missing previous account when running switch dash then it fails cleanly" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    var reg = try registry.loadRegistry(gpa, codex_home);
+    defer reg.deinit(gpa);
+    reg.previous_active_account_key = try fixtures.accountKeyForEmailAlloc(gpa, "removed@example.com");
+    try registry.saveRegistry(gpa, codex_home, &reg);
+
+    const result = try runCliWithIsolatedHome(
+        gpa,
+        project_root,
+        home_root,
+        &[_][]const u8{ "switch", "-" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expectEqualStrings("error: previous account is no longer available.\n", result.stderr);
+}
+
+test "Scenario: Given alias set with a direct local match when running alias then registry alias is updated" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+        .{ .email = "backup@example.com", .alias = "backup" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+
+    const result = try runCliWithIsolatedHome(
+        gpa,
+        project_root,
+        home_root,
+        &[_][]const u8{ "alias", "set", "backup@", "work" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings("Updated alias for backup@example.com: backup -> work\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    const backup_key = try fixtures.accountKeyForEmailAlloc(gpa, "backup@example.com");
+    defer gpa.free(backup_key);
+    const idx = registry.findAccountIndexByAccountKey(&loaded, backup_key) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("work", loaded.accounts.items[idx].alias);
+}
+
+test "Scenario: Given alias clear with display number when running alias then registry alias is removed" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+        .{ .email = "backup@example.com", .alias = "backup" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+
+    const result = try runCliWithIsolatedHome(
+        gpa,
+        project_root,
+        home_root,
+        &[_][]const u8{ "alias", "clear", "02" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings("Cleared alias for backup@example.com: backup\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    const backup_key = try fixtures.accountKeyForEmailAlloc(gpa, "backup@example.com");
+    defer gpa.free(backup_key);
+    const idx = registry.findAccountIndexByAccountKey(&loaded, backup_key) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("", loaded.accounts.items[idx].alias);
+}
+
+test "Scenario: Given alias set with duplicate alias when running alias then it fails without changing registry" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+        .{ .email = "backup@example.com", .alias = "backup" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+
+    const result = try runCliWithIsolatedHome(
+        gpa,
+        project_root,
+        home_root,
+        &[_][]const u8{ "alias", "set", "backup@", "ACTIVE" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "alias 'ACTIVE' is already used by active@example.com.") != null);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    const backup_key = try fixtures.accountKeyForEmailAlloc(gpa, "backup@example.com");
+    defer gpa.free(backup_key);
+    const idx = registry.findAccountIndexByAccountKey(&loaded, backup_key) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("backup", loaded.accounts.items[idx].alias);
+}
+
+test "Scenario: Given switch query with multiple matches when running switch then it asks for one account and switches only that account" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "team-a" },
+        .{ .email = "beta@example.com", .alias = "team-b" },
+        .{ .email = "solo@example.com", .alias = "solo" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+
+    const alpha_key = try fixtures.accountKeyForEmailAlloc(gpa, "alpha@example.com");
+    defer gpa.free(alpha_key);
+    const beta_key = try fixtures.accountKeyForEmailAlloc(gpa, "beta@example.com");
+    defer gpa.free(beta_key);
+    const alpha_snapshot_path = try registry.accountAuthPath(gpa, codex_home, alpha_key);
+    defer gpa.free(alpha_snapshot_path);
+    const beta_snapshot_path = try registry.accountAuthPath(gpa, codex_home, beta_key);
+    defer gpa.free(beta_snapshot_path);
+
+    const alpha_auth = try fixtures.authJsonWithEmailPlan(gpa, "alpha@example.com", "team");
+    defer gpa.free(alpha_auth);
+    const beta_auth = try fixtures.authJsonWithEmailPlan(gpa, "beta@example.com", "plus");
+    defer gpa.free(beta_auth);
+
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = alpha_auth });
+    try fs.cwd().writeFile(.{ .sub_path = alpha_snapshot_path, .data = alpha_auth });
+    try fs.cwd().writeFile(.{ .sub_path = beta_snapshot_path, .data = beta_auth });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPathAndStdin(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{ "switch", "team" },
+        "2\n",
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Select account to activate:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "alpha@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "beta@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "solo@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Switched to team-b(beta@example.com)") != null);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    const auth_after = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(auth_after);
+    try std.testing.expectEqualStrings(beta_auth, auth_after);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expect(loaded.active_account_key != null);
+    try std.testing.expect(std.mem.eql(u8, loaded.active_account_key.?, beta_key));
+}
+
+test "Scenario: Given switch query with no matches when running switch then it explains accepted target forms" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+        .{ .email = "backup@example.com", .alias = "backup" },
+    });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{ "switch", "missing" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expectEqualStrings(
+        "error: no switch target matches 'missing'.\n" ++
+            "hint: Switch accepts one target: alias, email, display number, or partial query.\n",
+        result.stderr,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "AccountNotFound") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "main.zig") == null);
+}
+
+test "Scenario: Given list default mode when running list then it requires api refresh executables" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "alpha" },
+    });
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{"list"},
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "curl is required") != null);
+}
+
+test "Scenario: Given list with skip-api when running list then it does not require api refresh executables" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "alpha" },
+        .{ .email = "beta@example.com", .alias = "beta" },
+    });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{ "list", "--skip-api" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "ACCOUNT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "alpha@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "beta@example.com") != null);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "Scenario: Given switch query with api flag when running switch then it returns a usage error" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+        .{ .email = "backup@example.com", .alias = "backup" },
+    });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{ "switch", "--api", "02" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "does not support `--live`, `--api`, or `--skip-api`") != null);
+}
+
+test "Scenario: Given switch query with skip-api flag when running switch then it returns a usage error" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+        .{ .email = "backup@example.com", .alias = "backup" },
+    });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{ "switch", "--skip-api", "02" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "does not support `--live`, `--api`, or `--skip-api`") != null);
+}
+
+test "Scenario: Given switch without api flags when running interactively then it requires api refresh executables by default" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+        .{ .email = "backup@example.com", .alias = "backup" },
+    });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPathAndStdin(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{"switch"},
+        "2\n",
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "curl is required") != null);
+}
+
+test "Scenario: Given switch with skip-api when running interactively then it does not require api refresh executables" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "active" },
+        .{ .email = "backup@example.com", .alias = "backup" },
+    });
+    try setStoredUsageSnapshotForAccount(
+        gpa,
+        home_root,
+        "active@example.com",
+        makeUsageSnapshot(25.0, 40.0),
+        1,
+        0,
+    );
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+
+    const active_key = try fixtures.accountKeyForEmailAlloc(gpa, "active@example.com");
+    defer gpa.free(active_key);
+    const backup_key = try fixtures.accountKeyForEmailAlloc(gpa, "backup@example.com");
+    defer gpa.free(backup_key);
+    const active_snapshot_path = try registry.accountAuthPath(gpa, codex_home, active_key);
+    defer gpa.free(active_snapshot_path);
+    const backup_snapshot_path = try registry.accountAuthPath(gpa, codex_home, backup_key);
+    defer gpa.free(backup_snapshot_path);
+
+    const active_auth = try fixtures.authJsonWithEmailPlan(gpa, "active@example.com", "team");
+    defer gpa.free(active_auth);
+    const backup_auth = try fixtures.authJsonWithEmailPlan(gpa, "backup@example.com", "plus");
+    defer gpa.free(backup_auth);
+
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = backup_snapshot_path, .data = backup_auth });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPathAndStdin(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{ "switch", "--skip-api" },
+        "2\n",
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Select account to activate:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Switched to backup(backup@example.com)") != null);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    const auth_after = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(auth_after);
+    try std.testing.expectEqualStrings(backup_auth, auth_after);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expect(loaded.active_account_key != null);
+    try std.testing.expect(std.mem.eql(u8, loaded.active_account_key.?, backup_key));
+}
+
+test "Scenario: Given remove query with one match when running remove then it deletes immediately and prints a summary" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "keeper@example.com", &[_]SeedAccount{
+        .{ .email = "robot09@example.com", .alias = "" },
+        .{ .email = "keeper@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const removed_account_key = try fixtures.accountKeyForEmailAlloc(gpa, "robot09@example.com");
+    defer gpa.free(removed_account_key);
+    const keeper_account_key = try fixtures.accountKeyForEmailAlloc(gpa, "keeper@example.com");
+    defer gpa.free(keeper_account_key);
+
+    const removed_snapshot_path = try registry.accountAuthPath(gpa, codex_home, removed_account_key);
+    defer gpa.free(removed_snapshot_path);
+    const keeper_snapshot_path = try registry.accountAuthPath(gpa, codex_home, keeper_account_key);
+    defer gpa.free(keeper_snapshot_path);
+
+    const removed_auth = try fixtures.authJsonWithEmailPlan(gpa, "robot09@example.com", "plus");
+    defer gpa.free(removed_auth);
+    const keeper_auth = try fixtures.authJsonWithEmailPlan(gpa, "keeper@example.com", "team");
+    defer gpa.free(keeper_auth);
+
+    try fs.cwd().writeFile(.{ .sub_path = removed_snapshot_path, .data = removed_auth });
+    try fs.cwd().writeFile(.{ .sub_path = keeper_snapshot_path, .data = keeper_auth });
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/accounts/auth.json.bak.20260320-010101", .data = removed_auth });
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/accounts/auth.json.bak.20260320-020202", .data = removed_auth });
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/accounts/auth.json.bak.20260320-030303", .data = keeper_auth });
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "09" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings(
+        "Removed 1 account(s): robot09@example.com\n",
+        result.stdout,
+    );
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, "keeper@example.com"));
+    try std.testing.expectError(error.FileNotFound, fs.cwd().openFile(removed_snapshot_path, .{}));
+    var keeper_snapshot = try fs.cwd().openFile(keeper_snapshot_path, .{});
+    keeper_snapshot.close();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(".codex/accounts/auth.json.bak.20260320-010101", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(".codex/accounts/auth.json.bak.20260320-020202", .{}));
+    var keeper_backup = try tmp.dir.openFile(".codex/accounts/auth.json.bak.20260320-030303", .{});
+    keeper_backup.close();
+}
+
+test "Scenario: Given remove with account key selector when running remove then it deletes the matching account" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "keeper@example.com", &[_]SeedAccount{
+        .{ .email = "robot09@example.com", .alias = "" },
+        .{ .email = "keeper@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const removed_account_key = try fixtures.accountKeyForEmailAlloc(gpa, "robot09@example.com");
+    defer gpa.free(removed_account_key);
+
+    const result = try runCliWithIsolatedHomeAndStdin(
+        gpa,
+        project_root,
+        home_root,
+        &[_][]const u8{ "remove", removed_account_key },
+        "",
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "robot09@example.com") != null);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, "keeper@example.com"));
+}
+
+test "Scenario: Given remove with multiple selectors when running remove then it deletes all selected accounts" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "beta@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "beta@example.com", .alias = "" },
+        .{ .email = "keeper@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+
+    const result = try runCliWithIsolatedHomeAndStdin(
+        gpa,
+        project_root,
+        home_root,
+        &[_][]const u8{ "remove", "01", "keeper@example.com" },
+        "",
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings(
+        "Removed 2 account(s): alpha@example.com, keeper@example.com\n",
+        result.stdout,
+    );
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(std.mem.eql(u8, loaded.accounts.items[0].email, "beta@example.com"));
+}
+
+test "Scenario: Given remove query with api flag when running remove then it returns a usage error" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "beta@example.com", .alias = "" },
+    });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{ "remove", "--api", "01" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "`remove <alias|email|display-number|query>...` and `remove --all` do not support") != null);
+}
+
+test "Scenario: Given remove query with skip-api flag when running remove then it returns a usage error" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "beta@example.com", .alias = "" },
+    });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPath(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{ "remove", "--skip-api", "01" },
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "`remove <alias|email|display-number|query>...` and `remove --all` do not support") != null);
+}
+
+test "Scenario: Given interactive remove with api flag when running remove then it requires api refresh executables" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "beta@example.com", .alias = "" },
+    });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPathAndStdin(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{ "remove", "--api" },
+        "2\n",
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "curl is required") != null);
+}
+
+test "Scenario: Given remove without api flags when running remove then it requires api refresh executables by default" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "beta@example.com", .alias = "" },
+    });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPathAndStdin(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{"remove"},
+        "2\n",
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "curl is required") != null);
+}
+
+test "Scenario: Given remove without selectors in default mode when running remove then it requires api refresh executables" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "beta@example.com", .alias = "" },
+    });
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPathAndStdin(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{"remove"},
+        "2\n",
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "curl is required") != null);
+}
+
+test "Scenario: Given remove with skip-api when running remove then it does not require api refresh executables" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "beta@example.com", .alias = "" },
+    });
+
+    try tmp.dir.makePath("empty-bin");
+    const empty_path = try tmp.dir.realpathAlloc(gpa, "empty-bin");
+    defer gpa.free(empty_path);
+
+    const result = try runCliWithIsolatedHomeAndPathAndStdin(
+        gpa,
+        project_root,
+        home_root,
+        empty_path,
+        &[_][]const u8{ "remove", "--skip-api" },
+        "2\n",
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Select accounts to delete:") != null);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "Scenario: Given active account removal with a replacement when running remove then it does not recreate a backup for the deleted auth" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "" },
+        .{ .email = "backup@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+
+    const active_key = try fixtures.accountKeyForEmailAlloc(gpa, "active@example.com");
+    defer gpa.free(active_key);
+    const backup_key = try fixtures.accountKeyForEmailAlloc(gpa, "backup@example.com");
+    defer gpa.free(backup_key);
+    const active_snapshot_path = try registry.accountAuthPath(gpa, codex_home, active_key);
+    defer gpa.free(active_snapshot_path);
+    const backup_snapshot_path = try registry.accountAuthPath(gpa, codex_home, backup_key);
+    defer gpa.free(backup_snapshot_path);
+
+    const active_auth = try fixtures.authJsonWithEmailPlan(gpa, "active@example.com", "pro");
+    defer gpa.free(active_auth);
+    const backup_auth = try fixtures.authJsonWithEmailPlan(gpa, "backup@example.com", "plus");
+    defer gpa.free(backup_auth);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = backup_snapshot_path, .data = backup_auth });
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "active@" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings("Removed 1 account(s): active@example.com\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    const replaced_auth = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(replaced_auth);
+    try std.testing.expectEqualStrings(backup_auth, replaced_auth);
+    try std.testing.expectError(error.FileNotFound, fs.cwd().openFile(active_snapshot_path, .{}));
+    try std.testing.expectEqual(@as(usize, 0), try countAuthBackups(tmp.dir, ".codex/accounts"));
+}
+
+test "Scenario: Given active account removal with a replacement when running remove then previous account is preserved" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "previous@example.com", .alias = "previous" },
+        .{ .email = "active@example.com", .alias = "active" },
+        .{ .email = "backup@example.com", .alias = "backup" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+
+    const previous_key = try fixtures.accountKeyForEmailAlloc(gpa, "previous@example.com");
+    defer gpa.free(previous_key);
+    const active_key = try fixtures.accountKeyForEmailAlloc(gpa, "active@example.com");
+    defer gpa.free(active_key);
+    const backup_key = try fixtures.accountKeyForEmailAlloc(gpa, "backup@example.com");
+    defer gpa.free(backup_key);
+
+    const previous_snapshot_path = try registry.accountAuthPath(gpa, codex_home, previous_key);
+    defer gpa.free(previous_snapshot_path);
+    const active_snapshot_path = try registry.accountAuthPath(gpa, codex_home, active_key);
+    defer gpa.free(active_snapshot_path);
+    const backup_snapshot_path = try registry.accountAuthPath(gpa, codex_home, backup_key);
+    defer gpa.free(backup_snapshot_path);
+
+    const previous_auth = try fixtures.authJsonWithEmailPlan(gpa, "previous@example.com", "pro");
+    defer gpa.free(previous_auth);
+    const active_auth = try fixtures.authJsonWithEmailPlan(gpa, "active@example.com", "plus");
+    defer gpa.free(active_auth);
+    const backup_auth = try fixtures.authJsonWithEmailPlan(gpa, "backup@example.com", "team");
+    defer gpa.free(backup_auth);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = previous_snapshot_path, .data = previous_auth });
+    try fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = backup_snapshot_path, .data = backup_auth });
+
+    var seeded = try registry.loadRegistry(gpa, codex_home);
+    defer seeded.deinit(gpa);
+    try registry.setActiveAccountKey(gpa, &seeded, previous_key);
+    try registry.setActiveAccountKey(gpa, &seeded, active_key);
+    registry.updateUsage(gpa, &seeded, backup_key, makeUsageSnapshot(10.0, 10.0));
+    try registry.saveRegistry(gpa, codex_home, &seeded);
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "active@" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings("Removed 1 account(s): active(active@example.com)\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    const replaced_auth = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(replaced_auth);
+    try std.testing.expectEqualStrings(backup_auth, replaced_auth);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expect(loaded.active_account_key != null);
+    try std.testing.expect(loaded.previous_active_account_key != null);
+    try std.testing.expectEqualStrings(backup_key, loaded.active_account_key.?);
+    try std.testing.expectEqualStrings(previous_key, loaded.previous_active_account_key.?);
+}
+
+test "Scenario: Given active account removal with missing auth json when running remove then replacement auth is recreated" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "" },
+        .{ .email = "backup@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+
+    const active_key = try fixtures.accountKeyForEmailAlloc(gpa, "active@example.com");
+    defer gpa.free(active_key);
+    const backup_key = try fixtures.accountKeyForEmailAlloc(gpa, "backup@example.com");
+    defer gpa.free(backup_key);
+    const active_snapshot_path = try registry.accountAuthPath(gpa, codex_home, active_key);
+    defer gpa.free(active_snapshot_path);
+    const backup_snapshot_path = try registry.accountAuthPath(gpa, codex_home, backup_key);
+    defer gpa.free(backup_snapshot_path);
+
+    const active_auth = try fixtures.authJsonWithEmailPlan(gpa, "active@example.com", "pro");
+    defer gpa.free(active_auth);
+    const backup_auth = try fixtures.authJsonWithEmailPlan(gpa, "backup@example.com", "plus");
+    defer gpa.free(backup_auth);
+    try fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = backup_snapshot_path, .data = backup_auth });
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "active@" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings("Removed 1 account(s): active@example.com\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    const recreated_auth = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(recreated_auth);
+    try std.testing.expectEqualStrings(backup_auth, recreated_auth);
+}
+
+test "Scenario: Given missing auth json and no valid active key when running remove then replacement auth is recreated" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "" },
+        .{ .email = "backup@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+
+    const active_key = try fixtures.accountKeyForEmailAlloc(gpa, "active@example.com");
+    defer gpa.free(active_key);
+    const backup_key = try fixtures.accountKeyForEmailAlloc(gpa, "backup@example.com");
+    defer gpa.free(backup_key);
+    const active_snapshot_path = try registry.accountAuthPath(gpa, codex_home, active_key);
+    defer gpa.free(active_snapshot_path);
+    const backup_snapshot_path = try registry.accountAuthPath(gpa, codex_home, backup_key);
+    defer gpa.free(backup_snapshot_path);
+
+    const active_auth = try fixtures.authJsonWithEmailPlan(gpa, "active@example.com", "pro");
+    defer gpa.free(active_auth);
+    const backup_auth = try fixtures.authJsonWithEmailPlan(gpa, "backup@example.com", "plus");
+    defer gpa.free(backup_auth);
+    try fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = backup_snapshot_path, .data = backup_auth });
+
+    var reg = try registry.loadRegistry(gpa, codex_home);
+    defer reg.deinit(gpa);
+    if (reg.active_account_key) |key| {
+        gpa.free(key);
+        reg.active_account_key = null;
+    }
+    reg.active_account_activated_at_ms = null;
+    try registry.saveRegistry(gpa, codex_home, &reg);
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "active@" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings("Removed 1 account(s): active@example.com\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    const recreated_auth = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(recreated_auth);
+    try std.testing.expectEqualStrings(backup_auth, recreated_auth);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(loaded.active_account_key != null);
+    try std.testing.expect(std.mem.eql(u8, loaded.active_account_key.?, backup_key));
+}
+
+test "Scenario: Given auth json already points at another registry account when removing it then later sync does not recreate that deleted account" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "beta@example.com", .alias = "" },
+    });
+    try writeFailingFakeCurl(gpa, tmp.dir, project_root);
+    const fake_curl_dir = try tmp.dir.realpathAlloc(gpa, "fake-curl-bin");
+    defer gpa.free(fake_curl_dir);
+    const path_override = try prependPathEntryAlloc(gpa, fake_curl_dir);
+    defer gpa.free(path_override);
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+
+    const alpha_key = try fixtures.accountKeyForEmailAlloc(gpa, "alpha@example.com");
+    defer gpa.free(alpha_key);
+    const beta_key = try fixtures.accountKeyForEmailAlloc(gpa, "beta@example.com");
+    defer gpa.free(beta_key);
+    const alpha_snapshot_path = try registry.accountAuthPath(gpa, codex_home, alpha_key);
+    defer gpa.free(alpha_snapshot_path);
+    const beta_snapshot_path = try registry.accountAuthPath(gpa, codex_home, beta_key);
+    defer gpa.free(beta_snapshot_path);
+
+    const alpha_auth = try fixtures.authJsonWithEmailPlan(gpa, "alpha@example.com", "team");
+    defer gpa.free(alpha_auth);
+    const beta_auth = try fixtures.authJsonWithEmailPlan(gpa, "beta@example.com", "plus");
+    defer gpa.free(beta_auth);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = beta_auth });
+    try fs.cwd().writeFile(.{ .sub_path = alpha_snapshot_path, .data = alpha_auth });
+    try fs.cwd().writeFile(.{ .sub_path = beta_snapshot_path, .data = beta_auth });
+
+    const remove_result = try runCliWithIsolatedHomeAndPath(gpa, project_root, home_root, path_override, &[_][]const u8{ "remove", "beta@" });
+    defer gpa.free(remove_result.stdout);
+    defer gpa.free(remove_result.stderr);
+
+    try expectSuccess(remove_result);
+    try std.testing.expectEqualStrings("Removed 1 account(s): beta@example.com\n", remove_result.stdout);
+    try std.testing.expectEqualStrings("", remove_result.stderr);
+
+    const auth_after_remove = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(auth_after_remove);
+    try std.testing.expectEqualStrings(alpha_auth, auth_after_remove);
+
+    var loaded_after_remove = try registry.loadRegistry(gpa, codex_home);
+    defer loaded_after_remove.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded_after_remove.accounts.items.len);
+    try std.testing.expect(std.mem.eql(u8, loaded_after_remove.accounts.items[0].email, "alpha@example.com"));
+    try std.testing.expect(loaded_after_remove.active_account_key != null);
+    try std.testing.expect(std.mem.eql(u8, loaded_after_remove.active_account_key.?, alpha_key));
+
+    const list_result = try runCliWithIsolatedHomeAndPath(gpa, project_root, home_root, path_override, &[_][]const u8{"list"});
+    defer gpa.free(list_result.stdout);
+    defer gpa.free(list_result.stderr);
+
+    try expectSuccess(list_result);
+    try std.testing.expect(std.mem.indexOf(u8, list_result.stdout, "alpha@example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_result.stdout, "beta@example.com") == null);
+
+    var loaded_after_list = try registry.loadRegistry(gpa, codex_home);
+    defer loaded_after_list.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded_after_list.accounts.items.len);
+    try std.testing.expect(std.mem.eql(u8, loaded_after_list.accounts.items[0].email, "alpha@example.com"));
+}
+
+test "Scenario: Given remove query with no matches when running remove then it exits cleanly with one stderr line" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "keeper@example.com", &[_]SeedAccount{
+        .{ .email = "keeper@example.com", .alias = "" },
+    });
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "tmp2" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expectEqualStrings(
+        "error: no account matches 'tmp2'.\n" ++
+            "hint: Remove accepts one or more aliases, emails, display numbers, or partial queries.\n",
+        result.stderr,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "AccountNotFound") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "main.zig") == null);
+}
+
+test "Scenario: Given multiple remove queries with no matches when running remove then it reports all missing selectors together" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "keeper@example.com", &[_]SeedAccount{
+        .{ .email = "keeper@example.com", .alias = "" },
+    });
+
+    const result = try runCliWithIsolatedHomeAndStdin(
+        gpa,
+        project_root,
+        home_root,
+        &[_][]const u8{ "remove", "112222", "222222" },
+        "",
+    );
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expectEqualStrings(
+        "error: no account matches: 112222, 222222.\n" ++
+            "hint: Remove accepts one or more aliases, emails, display numbers, or partial queries.\n",
+        result.stderr,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "AccountNotFound") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "main.zig") == null);
+}
+
+test "Scenario: Given non-tty remove with invalid selection input when running remove then it fails without deleting accounts" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "keeper@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "keeper@example.com", .alias = "" },
+    });
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{"remove"}, "{\"id\":1}\n");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Select accounts to delete:\n\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Enter account numbers (comma/space separated, empty to cancel): ") != null);
+    try std.testing.expectEqualStrings(
+        "error: invalid remove selection input.\n" ++
+            "hint: Use numbers separated by commas or spaces, for example `1 2` or `1,2`.\n",
+        result.stderr,
+    );
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), loaded.accounts.items.len);
+}
+
+test "Scenario: Given remove query with multiple matches in non-tty mode when running remove then it fails without reading piped stdin" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "keeper@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "team-a" },
+        .{ .email = "beta@example.com", .alias = "team-b" },
+        .{ .email = "keeper@example.com", .alias = "" },
+    });
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "team" }, "y\n");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expectEqualStrings(
+        "Matched multiple accounts:\n" ++
+            "- team-a(alpha@example.com)\n" ++
+            "- team-b(beta@example.com)\n" ++
+            "error: multiple accounts match the query in non-interactive mode.\n" ++
+            "hint: Refine the query to match one account, or run the command in a TTY.\n",
+        result.stderr,
+    );
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 3), loaded.accounts.items.len);
+}
+
+test "Scenario: Given remove fuzzy selector with multiple matches when running remove then it reports every matched account before deleting" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "keeper@example.com", &[_]SeedAccount{
+        .{ .email = "west@example.com", .alias = "ops-west" },
+        .{ .email = "east@example.com", .alias = "ops-east" },
+        .{ .email = "keeper@example.com", .alias = "keeper" },
+    });
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "ops" }, "y\n");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expectEqualStrings(
+        "Matched multiple accounts:\n" ++
+            "- ops-east(east@example.com)\n" ++
+            "- ops-west(west@example.com)\n" ++
+            "error: multiple accounts match the query in non-interactive mode.\n" ++
+            "hint: Refine the query to match one account, or run the command in a TTY.\n",
+        result.stderr,
+    );
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 3), loaded.accounts.items.len);
+}
+
+test "Scenario: Given remove query with duplicate-email accounts when running remove then confirmation output keeps list-style identity" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    var reg = fixtures.makeEmptyRegistry();
+    defer reg.deinit(gpa);
+    try appendCustomAccount(gpa, &reg, "user-a::acct-work", "alice@example.com", "work", .team);
+    try appendCustomAccount(gpa, &reg, "user-b::acct-personal", "alice@example.com", "personal", .plus);
+    reg.active_account_key = try gpa.dupe(u8, "user-a::acct-work");
+    reg.active_account_activated_at_ms = std.Io.Timestamp.now(app_runtime.io(), .real).toMilliseconds();
+    try registry.saveRegistry(gpa, codex_home, &reg);
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "alice@" }, "y\n");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings(
+        "Matched multiple accounts:\n" ++
+            "- alice@example.com / work\n" ++
+            "- alice@example.com / personal\n" ++
+            "error: multiple accounts match the query in non-interactive mode.\n" ++
+            "hint: Refine the query to match one account, or run the command in a TTY.\n",
+        result.stderr,
+    );
+}
+
+test "Scenario: Given remove query deletes the final active account when running remove then active auth is deleted too" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "solo@example.com", &[_]SeedAccount{
+        .{ .email = "solo@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+    const account_key = try fixtures.accountKeyForEmailAlloc(gpa, "solo@example.com");
+    defer gpa.free(account_key);
+    const snapshot_path = try registry.accountAuthPath(gpa, codex_home, account_key);
+    defer gpa.free(snapshot_path);
+
+    const solo_auth = try fixtures.authJsonWithEmailPlan(gpa, "solo@example.com", "pro");
+    defer gpa.free(solo_auth);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = solo_auth });
+    try fs.cwd().writeFile(.{ .sub_path = snapshot_path, .data = solo_auth });
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "solo" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings(
+        "Removed 1 account(s): solo@example.com\n",
+        result.stdout,
+    );
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), loaded.accounts.items.len);
+    try std.testing.expect(loaded.active_account_key == null);
+    try std.testing.expectError(error.FileNotFound, fs.cwd().openFile(active_auth_path, .{}));
+    try std.testing.expectError(error.FileNotFound, fs.cwd().openFile(snapshot_path, .{}));
+}
+
+test "Scenario: Given non-tty stdin when running interactive remove then it falls back to the numbered selector" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "keeper@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "keeper@example.com", .alias = "" },
+    });
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{"remove"}, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Select accounts to delete:\n\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Enter account numbers (comma/space separated, empty to cancel): ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\x1b[2J\x1b[H") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Keys: ↑/↓ or j/k move") == null);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "Scenario: Given remove all when running remove then it clears all accounts and deletes active auth" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "beta@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+    const active_auth = try fixtures.authJsonWithEmailPlan(gpa, "alpha@example.com", "pro");
+    defer gpa.free(active_auth);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = active_auth });
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "--all" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Removed 2 account(s): ") != null);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), loaded.accounts.items.len);
+    try std.testing.expect(loaded.active_account_key == null);
+    try std.testing.expectError(error.FileNotFound, fs.cwd().openFile(active_auth_path, .{}));
+}
+
+test "Scenario: Given remove all with malformed auth json when running remove then registry is cleared but auth json is preserved" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "beta@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = "{\"broken\":true}" });
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "--all" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Removed 2 account(s): ") != null);
+    try std.testing.expectEqualStrings("warning: auth.json missing email; skipping sync\n", result.stderr);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), loaded.accounts.items.len);
+    try std.testing.expect(loaded.active_account_key == null);
+
+    const auth_after = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(auth_after);
+    try std.testing.expectEqualStrings("{\"broken\":true}", auth_after);
+}
+
+test "Scenario: Given remove all with tracked auth json and no active key when running remove then auth json is deleted too" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "beta@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+    const alpha_auth = try fixtures.authJsonWithEmailPlan(gpa, "alpha@example.com", "pro");
+    defer gpa.free(alpha_auth);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = alpha_auth });
+
+    var reg = try registry.loadRegistry(gpa, codex_home);
+    defer reg.deinit(gpa);
+    if (reg.active_account_key) |key| {
+        gpa.free(key);
+        reg.active_account_key = null;
+    }
+    reg.active_account_activated_at_ms = null;
+    try registry.saveRegistry(gpa, codex_home, &reg);
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "--all" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Removed 2 account(s): ") != null);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), loaded.accounts.items.len);
+    try std.testing.expect(loaded.active_account_key == null);
+    try std.testing.expectError(error.FileNotFound, fs.cwd().openFile(active_auth_path, .{}));
+}
+
+test "Scenario: Given remove all with tracked auth json and stale active key when running remove then auth json is deleted too" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "alpha@example.com", &[_]SeedAccount{
+        .{ .email = "alpha@example.com", .alias = "" },
+        .{ .email = "beta@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+    const alpha_auth = try fixtures.authJsonWithEmailPlan(gpa, "alpha@example.com", "pro");
+    defer gpa.free(alpha_auth);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = alpha_auth });
+
+    var reg = try registry.loadRegistry(gpa, codex_home);
+    defer reg.deinit(gpa);
+    if (reg.active_account_key) |key| {
+        gpa.free(key);
+    }
+    reg.active_account_key = try gpa.dupe(u8, "user-stale::acct-stale");
+    reg.active_account_activated_at_ms = std.Io.Timestamp.now(app_runtime.io(), .real).toMilliseconds();
+    try registry.saveRegistry(gpa, codex_home, &reg);
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "--all" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Removed 2 account(s): ") != null);
+    try std.testing.expectEqualStrings("", result.stderr);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), loaded.accounts.items.len);
+    try std.testing.expect(loaded.active_account_key == null);
+    try std.testing.expectError(error.FileNotFound, fs.cwd().openFile(active_auth_path, .{}));
+}
+
+test "Scenario: Given unsynced active auth when removing the active registry account then auth json is preserved" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "" },
+        .{ .email = "backup@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+
+    const active_key = try fixtures.accountKeyForEmailAlloc(gpa, "active@example.com");
+    defer gpa.free(active_key);
+    const backup_key = try fixtures.accountKeyForEmailAlloc(gpa, "backup@example.com");
+    defer gpa.free(backup_key);
+    const active_snapshot_path = try registry.accountAuthPath(gpa, codex_home, active_key);
+    defer gpa.free(active_snapshot_path);
+    const backup_snapshot_path = try registry.accountAuthPath(gpa, codex_home, backup_key);
+    defer gpa.free(backup_snapshot_path);
+
+    const active_auth = try fixtures.authJsonWithEmailPlan(gpa, "active@example.com", "pro");
+    defer gpa.free(active_auth);
+    const backup_auth = try fixtures.authJsonWithEmailPlan(gpa, "backup@example.com", "plus");
+    defer gpa.free(backup_auth);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = "{\"broken\":true}" });
+    try fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = backup_snapshot_path, .data = backup_auth });
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "active@" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings("Removed 1 account(s): active@example.com\n", result.stdout);
+    try std.testing.expectEqualStrings("warning: auth.json missing email; skipping sync\n", result.stderr);
+
+    const auth_after = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(auth_after);
+    try std.testing.expectEqualStrings("{\"broken\":true}", auth_after);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(loaded.active_account_key != null);
+    try std.testing.expect(std.mem.eql(u8, loaded.active_account_key.?, backup_key));
+}
+
+test "Scenario: Given parseable auth without email for the active account when removing it then auth json is preserved" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    try seedRegistryWithAccounts(gpa, home_root, "active@example.com", &[_]SeedAccount{
+        .{ .email = "active@example.com", .alias = "" },
+        .{ .email = "backup@example.com", .alias = "" },
+    });
+
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+    const active_auth_path = try authJsonPathAlloc(gpa, home_root);
+    defer gpa.free(active_auth_path);
+
+    const active_key = try fixtures.accountKeyForEmailAlloc(gpa, "active@example.com");
+    defer gpa.free(active_key);
+    const backup_key = try fixtures.accountKeyForEmailAlloc(gpa, "backup@example.com");
+    defer gpa.free(backup_key);
+    const active_snapshot_path = try registry.accountAuthPath(gpa, codex_home, active_key);
+    defer gpa.free(active_snapshot_path);
+    const backup_snapshot_path = try registry.accountAuthPath(gpa, codex_home, backup_key);
+    defer gpa.free(backup_snapshot_path);
+
+    const missing_email_auth = try fixtures.authJsonWithoutEmailForEmail(gpa, "active@example.com", "pro");
+    defer gpa.free(missing_email_auth);
+    const active_auth = try fixtures.authJsonWithEmailPlan(gpa, "active@example.com", "pro");
+    defer gpa.free(active_auth);
+    const backup_auth = try fixtures.authJsonWithEmailPlan(gpa, "backup@example.com", "plus");
+    defer gpa.free(backup_auth);
+    try tmp.dir.writeFile(.{ .sub_path = ".codex/auth.json", .data = missing_email_auth });
+    try fs.cwd().writeFile(.{ .sub_path = active_snapshot_path, .data = active_auth });
+    try fs.cwd().writeFile(.{ .sub_path = backup_snapshot_path, .data = backup_auth });
+
+    const result = try runCliWithIsolatedHomeAndStdin(gpa, project_root, home_root, &[_][]const u8{ "remove", "active@" }, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expectEqualStrings("Removed 1 account(s): active@example.com\n", result.stdout);
+    try std.testing.expectEqualStrings("warning: auth.json missing email; skipping sync\n", result.stderr);
+
+    const auth_after = try fixtures.readFileAlloc(gpa, active_auth_path);
+    defer gpa.free(auth_after);
+    try std.testing.expectEqualStrings(missing_email_auth, auth_after);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), loaded.accounts.items.len);
+    try std.testing.expect(loaded.active_account_key != null);
+    try std.testing.expect(std.mem.eql(u8, loaded.active_account_key.?, backup_key));
+}
+
+test "Scenario: Given config live interval when running command then registry stores the interval" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+
+    const config_result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{ "config", "live", "--interval", "45" });
+    defer gpa.free(config_result.stdout);
+    defer gpa.free(config_result.stderr);
+    try expectSuccess(config_result);
+    try std.testing.expectEqualStrings("Live refresh interval: 45s\n", config_result.stdout);
+    try std.testing.expectEqualStrings("", config_result.stderr);
+
+    var loaded = try registry.loadRegistry(gpa, codex_home);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqual(@as(u16, 45), loaded.live.interval_seconds);
+
+    const registry_path = try registry.registryPath(gpa, codex_home);
+    defer gpa.free(registry_path);
+    const data = try fixtures.readFileAlloc(gpa, registry_path);
+    defer gpa.free(data);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"interval_seconds\": 45") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"live\"") == null);
+}
+
+test "Scenario: Given default api usage when listing accounts then no warning is printed" {
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{"list"});
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectSuccess(result);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "ACCOUNT") != null);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "Scenario: Given unsupported native host when launching app then command fails before launch plan" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .macos) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{
+        "app",
+        "--id",
+        "OpenAI.Codex",
+        "--codex-home",
+        codex_home,
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "app launch is supported only from the Windows or macOS codex-auth executable.\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Environment Configuration") == null);
+}
+
+test "Scenario: Given unsupported native host when launching app then managed CLI is not downloaded" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .macos) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    try tmp.dir.makePath(".codex");
+    const codex_home = try codexHomeAlloc(gpa, home_root);
+    defer gpa.free(codex_home);
+
+    const result = try runCliWithIsolatedHomeAndCodexHome(gpa, project_root, home_root, codex_home, &[_][]const u8{
+        "app",
+        "--id",
+        "OpenAI.Codex",
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "app launch is supported only from the Windows or macOS codex-auth executable.\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Environment Configuration") == null);
+
+    var codex_home_dir = try tmp.dir.openDir(".codex", .{});
+    defer codex_home_dir.close();
+    try std.testing.expectError(error.FileNotFound, codex_home_dir.access("codext-cli", .{}));
+}
+
+test "Scenario: Given unsupported native host with missing explicit codex CLI path then host rejection happens first" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .macos) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const project_root = try projectRootAlloc(gpa);
+    defer gpa.free(project_root);
+    try buildCliBinary(gpa, project_root);
+
+    var tmp = fs.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(home_root);
+    const missing_cli_path = try fs.path.join(gpa, &[_][]const u8{ home_root, "missing-codex" });
+    defer gpa.free(missing_cli_path);
+
+    const result = try runCliWithIsolatedHome(gpa, project_root, home_root, &[_][]const u8{
+        "app",
+        "--id",
+        "OpenAI.Codex",
+        "--codex-cli-path",
+        missing_cli_path,
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    try expectFailure(result);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "app launch is supported only from the Windows or macOS codex-auth executable.\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "ERROR: --codex-cli-path: Path does not exist\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, missing_cli_path) == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Environment Configuration") == null);
+}

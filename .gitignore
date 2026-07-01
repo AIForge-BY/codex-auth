@@ -1,0 +1,19 @@
+# Zig build artifacts
+zig-out/
+.zig-cache/
+dist/
+*.tgz
+
+# SwiftPM build artifacts
+.build/
+macos/**/.build/
+macos/**/.swiftpm/
+
+# macOS local metadata
+.DS_Store
+
+# IDE/Editor
+.idea/
+
+# Local benchmarking workspace
+benchmark/*

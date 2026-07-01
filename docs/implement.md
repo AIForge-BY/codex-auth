@@ -1,0 +1,130 @@
+# Implementation Details
+
+This document is the implementation index for `codex-auth`. Command-specific behavior lives in [docs/commands/README.md](./commands/README.md).
+
+## Related Documents
+
+- Command behavior: [docs/commands/README.md](./commands/README.md)
+- API refresh and endpoint rules: [docs/api.md](./api.md)
+- File permissions: [docs/permissions.md](./permissions.md)
+- Schema migration: [docs/schema-migration.md](./schema-migration.md)
+- Test organization: [docs/tests.md](./tests.md)
+- Release and CI: [docs/release.md](./release.md)
+
+## Runtime State
+
+`codex-auth` stores local state under the resolved Codex home. The resolution order is:
+
+1. `CODEX_HOME` when it is set to a non-empty existing directory
+2. `HOME/.codex`
+3. `USERPROFILE/.codex` on Windows
+
+Managed files:
+
+- `<codex_home>/auth.json`
+- `<codex_home>/accounts/registry.json`
+- `<codex_home>/accounts/<account file key>.auth.json`
+- `<codex_home>/accounts/backup/`
+- `<codex_home>/accounts/auth.json.bak.YYYYMMDD-hhmmss[.N]`
+- `<codex_home>/accounts/registry.json.bak.YYYYMMDD-hhmmss[.N]`
+- `<codex_home>/sessions/...`
+
+## Registry Compatibility
+
+- `registry.json.schema_version` is the on-disk migration gate.
+- `version = 2` registries using `active_email` and email-keyed snapshots are migrated to the current schema.
+- Current-layout files that still use the top-level `version = 3` key are rewritten to the current schema.
+- Loading a supported older schema performs the migration in memory and rewrites `registry.json` in the current format.
+- Loading a newer `schema_version` is rejected with `UnsupportedRegistryVersion`.
+- Saving always rewrites `registry.json` into the current schema field set.
+
+See [docs/schema-migration.md](./schema-migration.md) for versioning policy and migration rules.
+
+## Account Identity
+
+`codex-auth` separates the user identity from the ChatGPT workspace/account context.
+
+For ChatGPT OAuth auth:
+
+- `chatgpt_account_id` stores the ChatGPT account context used by local matching and ChatGPT API headers.
+- Account context selection is ordered:
+  1. use non-empty `tokens.account_id`
+  2. otherwise use non-empty JWT `https://api.openai.com/auth.chatgpt_account_id`
+  3. otherwise use JWT `https://api.openai.com/auth.organizations[].id`
+- `organizations[].id` is only a fallback for auth files that omit the legacy account id fields. When it is used, `chatgpt_account_id` is an `org-...` workspace identifier rather than the legacy UUID account id.
+- Organization fallback chooses the organization with `is_default = true`; if none exists, it uses the first organization with a non-empty `id`.
+- `chatgpt_user_id` is read from JWT auth claims, falling back to `user_id`.
+- The local unique key is `record_key = chatgpt_user_id + "::" + chatgpt_account_id`; the second segment may be either a legacy account id or the organization fallback id.
+- `account_key` stores this local `record_key`.
+- Snapshot filenames are derived from `record_key`; filename-unsafe values are base64url-encoded.
+- Email is normalized to lowercase and used for display/grouping, not identity.
+
+For OpenAI API-key auth:
+
+- `OPENAI_API_KEY` is read from `auth.json`.
+- The key is verified with `GET https://api.openai.com/v1/me`.
+- `email` from `/v1/me` is normalized to lowercase and used for display/grouping.
+- The local unique key is `account_key = "apikey::" + me.id + "::" + sha256(OPENAI_API_KEY)`.
+- The raw API key is stored only in the managed auth snapshot, never in `registry.json`, snapshot filenames, or display labels.
+- API-key rows use a local `API key <fingerprint>` account label so multiple keys under the same email remain distinguishable.
+
+## Auth Parsing
+
+If `OPENAI_API_KEY` is present, the account is treated as API-key auth. Otherwise, ChatGPT auth requires:
+
+- `tokens.access_token`
+- `tokens.id_token`
+- a ChatGPT account context from `tokens.account_id`, JWT `https://api.openai.com/auth.chatgpt_account_id`, or JWT `https://api.openai.com/auth.organizations[].id`
+- JWT user identity from `chatgpt_user_id` or `user_id`
+
+If required identity fields are missing or mismatched, import/login fails. Existing-registry foreground sync skips unsyncable auth files and continues with registry state already on disk.
+
+## Active Auth Sync
+
+Foreground account commands sync `auth.json` before their main work when the current auth file is parseable.
+
+The sync flow is:
+
+1. Read `~/.codex/auth.json`.
+2. Parse email, plan, auth mode, `chatgpt_user_id`, and `chatgpt_account_id`.
+3. Match by `record_key`.
+4. Update the matching account and active key, or create a new account record when no match exists.
+5. Rewrite the managed account snapshot when contents changed.
+
+The empty-registry auto-import path still requires a parseable auth file. Once a registry exists, malformed or incomplete `auth.json` is skipped rather than deleting stored accounts.
+
+## Backups and Cleanup
+
+- `auth.json` backups are created only when contents change.
+- `registry.json` backups are created only when contents change.
+- Backups are stored under `~/.codex/accounts/` with local-time names.
+- Same-second collisions get a `.N` suffix.
+- The newest five managed backups are retained.
+- `codex-auth clean` is whitelist-based for the current schema and affects only `~/.codex/accounts/`.
+
+Command behavior for cleanup lives in [docs/commands/clean.md](./commands/clean.md).
+
+## Local Usage Data
+
+When API usage refresh is disabled, local usage refresh reads Codex rollout files under `~/.codex/sessions/**/rollout-*.jsonl`.
+
+- The newest rollout file by `mtime` is scanned.
+- The scanner looks for `type:"event_msg"` and `payload.type:"token_count"`.
+- The last parseable `rate_limits` object in that file is used.
+- Rollout events older than the current account activation time are ignored.
+- Each account stores its own last consumed rollout signature.
+- Rate limits map `window_minutes = 300` to 5h and `window_minutes = 10080` to weekly.
+- Past reset timestamps render as `100%`.
+
+
+## Display Model
+
+- Human-readable account displays group records by email.
+- Group headers are not selectable; child account rows are selectable.
+- Alias labels take precedence for child rows.
+- Duplicate workspace-style plan labels may use stable numbered labels.
+- `PLAN` comes from the auth claim when available, then falls back to usage snapshot plan data.
+- Usage cells show remaining percentage plus reset time when reset data is known.
+- `LAST ACTIVITY` is rendered as relative time from `last_usage_at`.
+
+Command-specific display behavior lives in the relevant file under [docs/commands/](./commands/).

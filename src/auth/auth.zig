@@ -1,0 +1,425 @@
+const std = @import("std");
+const app_runtime = @import("../core/runtime.zig");
+const registry = @import("../registry/root.zig");
+
+pub const AuthInfo = struct {
+    email: ?[]u8,
+    chatgpt_account_id: ?[]u8,
+    chatgpt_user_id: ?[]u8,
+    record_key: ?[]u8,
+    access_token: ?[]u8,
+    openai_api_key: ?[]u8 = null,
+    last_refresh: ?[]u8,
+    plan: ?registry.PlanType,
+    auth_mode: registry.AuthMode,
+
+    pub fn deinit(self: *const AuthInfo, allocator: std.mem.Allocator) void {
+        if (self.email) |e| allocator.free(e);
+        if (self.chatgpt_account_id) |id| allocator.free(id);
+        if (self.chatgpt_user_id) |id| allocator.free(id);
+        if (self.record_key) |key| allocator.free(key);
+        if (self.access_token) |token| allocator.free(token);
+        if (self.openai_api_key) |key| allocator.free(key);
+        if (self.last_refresh) |value| allocator.free(value);
+    }
+};
+
+const StandardAuthJson = struct {
+    auth_mode: []const u8,
+    OPENAI_API_KEY: std.json.Value,
+    tokens: struct {
+        id_token: []const u8,
+        access_token: []const u8,
+        refresh_token: ?[]const u8,
+        account_id: []const u8,
+    },
+    last_refresh: ?[]const u8,
+};
+
+const CpaAuthJson = struct {
+    id_token: []const u8,
+    access_token: []const u8,
+    refresh_token: ?[]const u8,
+    account_id: ?[]const u8,
+    last_refresh: ?[]const u8,
+};
+
+fn normalizeEmailAlloc(allocator: std.mem.Allocator, email: []const u8) ![]u8 {
+    var buf = try allocator.alloc(u8, email.len);
+    for (email, 0..) |ch, i| {
+        buf[i] = std.ascii.toLower(ch);
+    }
+    return buf;
+}
+
+fn recordKeyAlloc(
+    allocator: std.mem.Allocator,
+    chatgpt_user_id: []const u8,
+    chatgpt_account_id: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}::{s}", .{ chatgpt_user_id, chatgpt_account_id });
+}
+
+pub fn parseAuthInfo(allocator: std.mem.Allocator, auth_path: []const u8) !AuthInfo {
+    const file = try std.Io.Dir.cwd().openFile(app_runtime.io(), auth_path, .{});
+    defer file.close(app_runtime.io());
+
+    var read_buffer: [4096]u8 = undefined;
+    var file_reader = file.reader(app_runtime.io(), &read_buffer);
+    const data = try file_reader.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
+    defer allocator.free(data);
+
+    return try parseAuthInfoData(allocator, data);
+}
+
+pub fn parseAuthInfoData(allocator: std.mem.Allocator, data: []const u8) !AuthInfo {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const root = parsed.value;
+    switch (root) {
+        .object => |obj| {
+            if (obj.get("OPENAI_API_KEY")) |key_val| {
+                switch (key_val) {
+                    .string => |s| {
+                        const trimmed = std.mem.trim(u8, s, &std.ascii.whitespace);
+                        if (trimmed.len > 0) return AuthInfo{
+                            .email = null,
+                            .chatgpt_account_id = null,
+                            .chatgpt_user_id = null,
+                            .record_key = null,
+                            .access_token = null,
+                            .openai_api_key = try allocator.dupe(u8, trimmed),
+                            .last_refresh = null,
+                            .plan = null,
+                            .auth_mode = .apikey,
+                        };
+                    },
+                    else => {},
+                }
+            }
+
+            var last_refresh = if (obj.get("last_refresh")) |last_refresh_val| switch (last_refresh_val) {
+                .string => |s| if (s.len > 0) try allocator.dupe(u8, s) else null,
+                else => null,
+            } else null;
+            defer if (last_refresh) |value| allocator.free(value);
+
+            if (obj.get("tokens")) |tokens_val| {
+                switch (tokens_val) {
+                    .object => |tobj| {
+                        var access_token: ?[]u8 = null;
+                        defer if (access_token) |token| allocator.free(token);
+                        access_token = if (tobj.get("access_token")) |access_token_val| switch (access_token_val) {
+                            .string => |s| if (s.len > 0) try allocator.dupe(u8, s) else null,
+                            else => null,
+                        } else null;
+                        var token_chatgpt_account_id: ?[]u8 = null;
+                        defer if (token_chatgpt_account_id) |id| allocator.free(id);
+                        token_chatgpt_account_id = if (tobj.get("account_id")) |account_id_val| switch (account_id_val) {
+                            .string => |s| if (s.len > 0) try allocator.dupe(u8, s) else null,
+                            else => null,
+                        } else null;
+                        if (tobj.get("id_token")) |id_tok| {
+                            switch (id_tok) {
+                                .string => |jwt| {
+                                    const payload = try decodeJwtPayload(allocator, jwt);
+                                    defer allocator.free(payload);
+                                    var payload_json = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+                                    defer payload_json.deinit();
+                                    const claims = payload_json.value;
+
+                                    var jwt_chatgpt_account_id: ?[]u8 = null;
+                                    defer if (jwt_chatgpt_account_id) |id| allocator.free(id);
+                                    var chatgpt_user_id: ?[]u8 = null;
+                                    defer if (chatgpt_user_id) |id| allocator.free(id);
+                                    switch (claims) {
+                                        .object => |cobj| {
+                                            var email: ?[]u8 = null;
+                                            defer if (email) |e| allocator.free(e);
+                                            if (cobj.get("email")) |e| {
+                                                switch (e) {
+                                                    .string => |s| email = try normalizeEmailAlloc(allocator, s),
+                                                    else => {},
+                                                }
+                                            }
+
+                                            var plan: ?registry.PlanType = null;
+                                            if (cobj.get("https://api.openai.com/auth")) |auth_obj| {
+                                                switch (auth_obj) {
+                                                    .object => |aobj| {
+                                                        if (aobj.get("chatgpt_account_id")) |ai| {
+                                                            switch (ai) {
+                                                                .string => |s| {
+                                                                    if (s.len > 0) {
+                                                                        jwt_chatgpt_account_id = try allocator.dupe(u8, s);
+                                                                    }
+                                                                },
+                                                                else => {},
+                                                            }
+                                                        }
+                                                        if (jwt_chatgpt_account_id == null) {
+                                                            jwt_chatgpt_account_id = try organizationAccountIdAlloc(allocator, aobj);
+                                                        }
+                                                        if (aobj.get("chatgpt_plan_type")) |pt| {
+                                                            switch (pt) {
+                                                                .string => |s| plan = parsePlanType(s),
+                                                                else => {},
+                                                            }
+                                                        }
+                                                        if (aobj.get("chatgpt_user_id")) |uid| {
+                                                            switch (uid) {
+                                                                .string => |s| {
+                                                                    if (s.len > 0) {
+                                                                        chatgpt_user_id = try allocator.dupe(u8, s);
+                                                                    }
+                                                                },
+                                                                else => {},
+                                                            }
+                                                        } else if (aobj.get("user_id")) |uid| {
+                                                            switch (uid) {
+                                                                .string => |s| {
+                                                                    if (s.len > 0) {
+                                                                        chatgpt_user_id = try allocator.dupe(u8, s);
+                                                                    }
+                                                                },
+                                                                else => {},
+                                                            }
+                                                        }
+                                                    },
+                                                    else => {},
+                                                }
+                                            }
+
+                                            const chatgpt_account_id = try resolveChatGptAccountId(token_chatgpt_account_id, jwt_chatgpt_account_id);
+                                            const chatgpt_user_id_value = chatgpt_user_id orelse return error.MissingChatgptUserId;
+                                            const record_key = try recordKeyAlloc(allocator, chatgpt_user_id_value, chatgpt_account_id);
+
+                                            const info = AuthInfo{
+                                                .email = email,
+                                                .chatgpt_account_id = chatgpt_account_id,
+                                                .chatgpt_user_id = chatgpt_user_id_value,
+                                                .record_key = record_key,
+                                                .access_token = access_token,
+                                                .openai_api_key = null,
+                                                .last_refresh = last_refresh,
+                                                .plan = plan,
+                                                .auth_mode = .chatgpt,
+                                            };
+                                            email = null;
+                                            if (token_chatgpt_account_id != null) {
+                                                token_chatgpt_account_id = null;
+                                            } else {
+                                                jwt_chatgpt_account_id = null;
+                                            }
+                                            chatgpt_user_id = null;
+                                            access_token = null;
+                                            last_refresh = null;
+                                            return info;
+                                        },
+                                        else => {},
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        },
+        else => {},
+    }
+
+    return AuthInfo{
+        .email = null,
+        .chatgpt_account_id = null,
+        .chatgpt_user_id = null,
+        .record_key = null,
+        .access_token = null,
+        .openai_api_key = null,
+        .last_refresh = null,
+        .plan = null,
+        .auth_mode = .chatgpt,
+    };
+}
+
+pub fn convertCpaAuthJson(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidCPAFormat,
+    };
+
+    const id_token = jsonNonEmptyStringField(obj, "id_token") orelse return error.MissingIdToken;
+    const access_token = jsonNonEmptyStringField(obj, "access_token") orelse return error.MissingAccessToken;
+    const account_id = try cpaAccountIdFromIdTokenAlloc(allocator, obj) orelse return error.MissingAccountId;
+    defer allocator.free(account_id);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    try std.json.Stringify.value(StandardAuthJson{
+        .auth_mode = "chatgpt",
+        .OPENAI_API_KEY = .null,
+        .tokens = .{
+            .id_token = id_token,
+            .access_token = access_token,
+            .refresh_token = jsonNonEmptyStringField(obj, "refresh_token"),
+            .account_id = account_id,
+        },
+        .last_refresh = jsonNonEmptyStringField(obj, "last_refresh"),
+    }, .{ .whitespace = .indent_2, .emit_null_optional_fields = false }, &out.writer);
+    try out.writer.writeAll("\n");
+    return try out.toOwnedSlice();
+}
+
+pub fn convertStandardAuthJsonToCpa(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidAuthFormat,
+    };
+    const tokens_val = obj.get("tokens") orelse return error.MissingTokens;
+    const tokens = switch (tokens_val) {
+        .object => |tokens| tokens,
+        else => return error.MissingTokens,
+    };
+    const id_token = jsonNonEmptyStringField(tokens, "id_token") orelse return error.MissingIdToken;
+    const access_token = jsonNonEmptyStringField(tokens, "access_token") orelse return error.MissingAccessToken;
+    const account_id = try cpaAccountIdFromIdTokenAlloc(allocator, tokens) orelse return error.MissingAccountId;
+    defer allocator.free(account_id);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    try std.json.Stringify.value(CpaAuthJson{
+        .id_token = id_token,
+        .access_token = access_token,
+        .refresh_token = jsonNonEmptyStringField(tokens, "refresh_token"),
+        .account_id = account_id,
+        .last_refresh = jsonNonEmptyStringField(obj, "last_refresh"),
+    }, .{ .whitespace = .indent_2, .emit_null_optional_fields = false }, &out.writer);
+    try out.writer.writeAll("\n");
+    return try out.toOwnedSlice();
+}
+
+pub fn decodeJwtPayload(allocator: std.mem.Allocator, jwt: []const u8) ![]u8 {
+    var it = std.mem.splitScalar(u8, jwt, '.');
+    _ = it.next();
+    const payload_b64 = it.next() orelse return error.InvalidJwt;
+    _ = it.next() orelse return error.InvalidJwt;
+
+    const decoded = try base64UrlNoPadDecode(allocator, payload_b64);
+    return decoded;
+}
+
+fn base64UrlNoPadDecode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const out_len = decoder.calcSizeForSlice(input) catch return error.InvalidBase64;
+    const buf = try allocator.alloc(u8, out_len);
+    errdefer allocator.free(buf);
+    decoder.decode(buf, input) catch return error.InvalidBase64;
+    return buf;
+}
+
+fn parsePlanType(s: []const u8) registry.PlanType {
+    if (std.ascii.eqlIgnoreCase(s, "free")) return .free;
+    if (std.ascii.eqlIgnoreCase(s, "plus")) return .plus;
+    if (std.ascii.eqlIgnoreCase(s, "prolite")) return .prolite;
+    if (std.ascii.eqlIgnoreCase(s, "pro")) return .pro;
+    if (std.ascii.eqlIgnoreCase(s, "team")) return .team;
+    if (std.ascii.eqlIgnoreCase(s, "business")) return .business;
+    if (std.ascii.eqlIgnoreCase(s, "enterprise")) return .enterprise;
+    if (std.ascii.eqlIgnoreCase(s, "edu")) return .edu;
+    return .unknown;
+}
+
+fn organizationAccountIdAlloc(allocator: std.mem.Allocator, auth_obj: std.json.ObjectMap) !?[]u8 {
+    const organizations_val = auth_obj.get("organizations") orelse return null;
+    const organizations = switch (organizations_val) {
+        .array => |arr| arr,
+        else => return null,
+    };
+
+    var first_id: ?[]const u8 = null;
+    for (organizations.items) |organization_val| {
+        const organization_obj = switch (organization_val) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        const id = jsonStringField(organization_obj, "id") orelse continue;
+        if (id.len == 0) continue;
+        if (first_id == null) first_id = id;
+
+        const is_default = if (organization_obj.get("is_default")) |is_default_val| switch (is_default_val) {
+            .bool => |value| value,
+            else => false,
+        } else false;
+        if (is_default) return try allocator.dupe(u8, id);
+    }
+
+    if (first_id) |id| return try allocator.dupe(u8, id);
+    return null;
+}
+
+fn cpaAccountIdFromIdTokenAlloc(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !?[]u8 {
+    const id_token = jsonNonEmptyStringField(obj, "id_token") orelse return null;
+    const payload = try decodeJwtPayload(allocator, id_token);
+    defer allocator.free(payload);
+
+    var payload_json = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer payload_json.deinit();
+
+    const claims = switch (payload_json.value) {
+        .object => |cobj| cobj,
+        else => return null,
+    };
+    const auth_val = claims.get("https://api.openai.com/auth") orelse return null;
+    const auth_obj = switch (auth_val) {
+        .object => |aobj| aobj,
+        else => return null,
+    };
+
+    if (jsonNonEmptyStringField(auth_obj, "chatgpt_account_id")) |account_id| {
+        return try allocator.dupe(u8, account_id);
+    }
+    return try organizationAccountIdAlloc(allocator, auth_obj);
+}
+
+fn resolveChatGptAccountId(
+    token_chatgpt_account_id: ?[]u8,
+    jwt_chatgpt_account_id: ?[]u8,
+) ![]u8 {
+    if (token_chatgpt_account_id) |token_id| {
+        if (jwt_chatgpt_account_id) |jwt_id| {
+            if (!std.mem.eql(u8, token_id, jwt_id)) return error.AccountIdMismatch;
+        }
+        return token_id;
+    }
+
+    const jwt_id = jwt_chatgpt_account_id orelse return error.MissingAccountId;
+    return jwt_id;
+}
+
+fn jsonStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn jsonNonEmptyStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = jsonStringField(obj, key) orelse return null;
+    const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+    if (trimmed.len == 0) return null;
+    return trimmed;
+}
+
+fn jsonStringFieldOrDefault(obj: std.json.ObjectMap, key: []const u8) []const u8 {
+    return jsonStringField(obj, key) orelse "";
+}
