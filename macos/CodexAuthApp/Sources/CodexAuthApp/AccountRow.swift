@@ -78,10 +78,7 @@ struct AccountRow: View {
     }
 
     private func usageColor(for window: UsageWindow) -> Color {
-        guard window.status == "ok", window.remainingPercent != nil else {
-            return .secondary
-        }
-        return window.isLowRemaining ? .red : .green
+        window.menuBarUsageTone.usageColor
     }
 
     @ViewBuilder

@@ -17,3 +17,6 @@ macos/**/.swiftpm/
 
 # Local benchmarking workspace
 benchmark/*
+
+# Local brainstorming companion artifacts
+.superpowers/

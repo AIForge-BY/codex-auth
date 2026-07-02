@@ -104,4 +104,66 @@ final class ModelsTests: XCTestCase {
         XCTAssertFalse(boundary.isLowRemaining)
         XCTAssertFalse(unknown.isLowRemaining)
     }
+
+    func testMenuBarQuotaLinesUseCompactFiveHourAndSevenDayText() {
+        let account = CodexAccount(
+            accountKey: "acct-123456",
+            displayName: "me@example.com",
+            alias: "工作号",
+            email: "me@example.com",
+            accountName: nil,
+            plan: "plus",
+            authMode: "chatgpt",
+            isActive: true,
+            usage: UsageInfo(
+                fiveHour: UsageWindow(status: "ok", remainingPercent: 99, total: 100, used: 1, resetAt: nil),
+                sevenDay: UsageWindow(status: "ok", remainingPercent: 100, total: 100, used: 0, resetAt: nil)
+            ),
+            lastUsageAt: nil,
+            lastRefreshAt: nil
+        )
+
+        XCTAssertEqual(account.menuBarFiveHourText, "5h 99%")
+        XCTAssertEqual(account.menuBarSevenDayText, "7d 100%")
+    }
+
+    func testMenuBarQuotaUsesFallbackForUnknownUsage() {
+        let window = UsageWindow(status: "network_error", remainingPercent: nil, total: nil, used: nil, resetAt: nil)
+
+        XCTAssertEqual(window.menuBarPercentText, "--")
+        XCTAssertEqual(window.menuBarUsageTone, .unavailable)
+    }
+
+    func testMenuBarQuotaToneMatchesExistingUsageThreshold() {
+        let low = UsageWindow(status: "ok", remainingPercent: 19, total: 100, used: 81, resetAt: nil)
+        let available = UsageWindow(status: "ok", remainingPercent: 20, total: 100, used: 80, resetAt: nil)
+
+        XCTAssertEqual(low.menuBarUsageTone, .low)
+        XCTAssertEqual(available.menuBarUsageTone, .available)
+    }
+
+    func testStatusItemPresentationUsesVisibleSingleLineSegments() {
+        let account = CodexAccount(
+            accountKey: "acct-123456",
+            displayName: "me@example.com",
+            alias: "工作号",
+            email: "me@example.com",
+            accountName: nil,
+            plan: "plus",
+            authMode: "chatgpt",
+            isActive: true,
+            usage: UsageInfo(
+                fiveHour: UsageWindow(status: "ok", remainingPercent: 99, total: 100, used: 1, resetAt: nil),
+                sevenDay: UsageWindow(status: "ok", remainingPercent: 12, total: 100, used: 88, resetAt: nil)
+            ),
+            lastUsageAt: nil,
+            lastRefreshAt: nil
+        )
+
+        let presentation = StatusItemPresentation(account: account, isLoading: false)
+
+        XCTAssertEqual(presentation.plainText, "5h 99%\n7d 12%")
+        XCTAssertEqual(presentation.segments.map(\.tone), [.available, .low])
+        XCTAssertLessThan(presentation.minimumStatusItemLength, 78)
+    }
 }

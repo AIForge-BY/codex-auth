@@ -127,6 +127,14 @@ struct CodexAccount: Decodable, Identifiable, Equatable {
         usage.sevenDay.displayTextWithReset
     }
 
+    var menuBarFiveHourText: String {
+        "5h \(usage.fiveHour.menuBarPercentText)"
+    }
+
+    var menuBarSevenDayText: String {
+        "7d \(usage.sevenDay.menuBarPercentText)"
+    }
+
     static func sample(accountKey: String, alias: String?, isActive: Bool) -> CodexAccount {
         CodexAccount(
             accountKey: accountKey,
@@ -166,6 +174,13 @@ struct UsageWindow: Decodable, Equatable {
         return "\(remainingPercent)%"
     }
 
+    var menuBarPercentText: String {
+        guard status == "ok", let remainingPercent else {
+            return "--"
+        }
+        return "\(remainingPercent)%"
+    }
+
     var resetLabel: String? {
         guard let resetText else {
             return nil
@@ -185,6 +200,13 @@ struct UsageWindow: Decodable, Equatable {
             return false
         }
         return remainingPercent < 20
+    }
+
+    var menuBarUsageTone: UsageTone {
+        guard status == "ok", remainingPercent != nil else {
+            return .unavailable
+        }
+        return isLowRemaining ? .low : .available
     }
 
     private var resetText: String? {
@@ -208,6 +230,12 @@ struct UsageWindow: Decodable, Equatable {
             return "未知状态"
         }
     }
+}
+
+enum UsageTone: Equatable {
+    case available
+    case low
+    case unavailable
 }
 
 private enum UsageResetDateFormatter {

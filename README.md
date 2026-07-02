@@ -2,98 +2,108 @@
 
 ![command list](https://github.com/user-attachments/assets/6c13a2d6-f9da-47ea-8ec8-0394fc072d40)
 
-`codex-auth` is a command-line tool for switching Codex accounts.
+`codex-auth` 是一个用于管理和切换 Codex 账号的命令行工具，也提供 macOS 菜单栏 App，方便在本机快速查看账号额度并切换账号。
 
-## Install
+## 安装
 
-Install with npm:
+使用 npm 全局安装：
 
 ```shell
 npm install -g @loongphy/codex-auth
 ```
 
-You can also run it without a global install:
+也可以不全局安装，直接通过 `npx` 运行：
 
 ```shell
 npx @loongphy/codex-auth list
 ```
 
-## Supported Platforms
-
-`codex-auth` works with these Codex clients:
-
-- Codex CLI
-- VS Code extension
-- Codex App
-
-> [!IMPORTANT]
-> For **Codex CLI** and **Codex App** users, switch accounts, then restart the client for the new account to take effect.
->
-> If you want seamless automatic account switching without restarting, use the forked [`codext`](https://github.com/Loongphy/codext), an enhanced Codex CLI.
->
-> Install it with `npm i -g @loongphy/codext` and run `codext`.
->
-> Codex App users can use `codex-auth app`, but it is not stable. See [Details](#codex-app).
-
-Install the Codex CLI even if you mainly use the VS Code extension or the App, because it makes adding accounts easier:
+如果主要使用 VS Code 扩展或 Codex App，也建议安装 Codex CLI，因为它能让登录和添加账号更简单：
 
 ```shell
 npm install -g @openai/codex
 ```
 
-After that, you can use `codex-auth login`, or `codex-auth login --device-auth` to sign in and add accounts more easily.
+安装后可通过以下命令登录并添加账号：
 
-## Commands
+```shell
+codex-auth login
+codex-auth login --device-auth
+```
 
-Detailed command documentation lives in [docs/commands/README.md](./docs/commands/README.md).
+## 支持的平台
+
+`codex-auth` 支持以下 Codex 客户端：
+
+- Codex CLI
+- VS Code 扩展
+- Codex App
+- macOS 菜单栏 App
+
+> [!IMPORTANT]
+> 对于 **Codex CLI** 和 **Codex App**，切换账号后需要重启客户端，新的账号才会生效。
+>
+> 如果需要不重启即可无缝切换账号，可以使用增强版 Codex CLI 分支 [`codext`](https://github.com/Loongphy/codext)。
+>
+> 安装方式：
+>
+> ```bash
+> npm i -g @loongphy/codext
+> ```
+>
+> 然后运行 `codext`。
+
+## 常用命令
+
+完整命令文档见 [docs/commands/README.md](./docs/commands/README.md)。
 
 > [!NOTE]
-> This documentation is based on **v0.3.x**. Some commands described here may not be available in the current release.
+> 本文档基于 **v0.3.x**。部分命令可能尚未包含在当前稳定版中。
 >
-> To try the latest features, please install the alpha version via:
+> 如需体验最新功能，可安装 alpha 版本：
 >
 > ```bash
 > npm install -g @loongphy/codex-auth@next
 > ```
-> 
-> If you want to downgrade to **v0.2.x**, you may need to manually update the `~/.codex/accounts/registry.json`:
+>
+> 如果需要降级到 **v0.2.x**，可能需要手动把 `~/.codex/accounts/registry.json` 中的版本改为：
 >
 > ```json
 > "schema_version": 3
 > ```
 
-### Account Management
+### 账号管理
 
-| Command | Description |
-|---------|-------------|
-| [`codex-auth list [--live] [--active] [--api\|--skip-api]`](./docs/commands/list.md) | List stored accounts and usage state |
-| [`codex-auth login [--device-auth]`](./docs/commands/login.md) | Run `codex login`, then add the current account |
-| [`codex-auth switch [--live] [--api\|--skip-api]`](./docs/commands/switch.md) | Switch the active account interactively |
-| [`codex-auth switch <query>`](./docs/commands/switch.md) | Switch directly by row number or account selector |
-| [`codex-auth remove [--live] [--api\|--skip-api]`](./docs/commands/remove.md) | Remove accounts interactively |
-| [`codex-auth remove <query> [<query>...]`](./docs/commands/remove.md) | Remove accounts by selector |
-| [`codex-auth remove --all`](./docs/commands/remove.md) | Remove all stored accounts |
-| [`codex-auth alias set <query> <alias>`](./docs/commands/alias.md) | Set an alias for an account |
-| [`codex-auth alias clear <query>`](./docs/commands/alias.md) | Clear the alias for an account |
+| 命令 | 说明 |
+|------|------|
+| [`codex-auth list [--live] [--active] [--api\|--skip-api]`](./docs/commands/list.md) | 列出已保存账号和额度状态 |
+| [`codex-auth login [--device-auth]`](./docs/commands/login.md) | 运行 `codex login`，并把当前账号加入管理列表 |
+| [`codex-auth switch [--live] [--api\|--skip-api]`](./docs/commands/switch.md) | 交互式切换活动账号 |
+| [`codex-auth switch <query>`](./docs/commands/switch.md) | 通过行号或账号选择器直接切换 |
+| [`codex-auth remove [--live] [--api\|--skip-api]`](./docs/commands/remove.md) | 交互式移除账号 |
+| [`codex-auth remove <query> [<query>...]`](./docs/commands/remove.md) | 通过选择器移除账号 |
+| [`codex-auth remove --all`](./docs/commands/remove.md) | 移除所有已保存账号 |
+| [`codex-auth alias set <query> <alias>`](./docs/commands/alias.md) | 设置账号别名 |
+| [`codex-auth alias clear <query>`](./docs/commands/alias.md) | 清除账号别名 |
 
-### Import and Maintenance
+### 导入、导出与维护
 
-| Command | Description |
-|---------|-------------|
-| [`codex-auth import <path> [--alias <alias>]`](./docs/commands/import.md) | Import a single auth file or batch import a folder |
-| [`codex-auth import --cpa [<path>]`](./docs/commands/import.md) | Import CLIProxyAPI token JSON |
-| [`codex-auth import --purge [<path>]`](./docs/commands/import.md) | Rebuild `registry.json` from auth files |
-| [`codex-auth export [<dir>]`](./docs/commands/export.md) | Export stored account auth files |
-| [`codex-auth export --cpa [<dir>]`](./docs/commands/export.md) | Export CLIProxyAPI token JSON |
-| [`codex-auth clean`](./docs/commands/clean.md) | Delete managed backup and stale account files |
+| 命令 | 说明 |
+|------|------|
+| [`codex-auth import <path> [--alias <alias>]`](./docs/commands/import.md) | 导入单个认证文件，或批量导入文件夹 |
+| [`codex-auth import --cpa [<path>]`](./docs/commands/import.md) | 导入 CLIProxyAPI token JSON |
+| [`codex-auth import --purge [<path>]`](./docs/commands/import.md) | 从认证文件重建 `registry.json` |
+| [`codex-auth export [<dir>]`](./docs/commands/export.md) | 导出已保存账号的认证文件 |
+| [`codex-auth export --cpa [<dir>]`](./docs/commands/export.md) | 导出 CLIProxyAPI token JSON |
+| [`codex-auth clean`](./docs/commands/clean.md) | 删除托管备份和过期账号文件 |
 
-### Configuration
+### 配置
 
-| Command | Description |
-|---------|-------------|
-| [`codex-auth config live --interval <seconds>`](./docs/commands/config.md) | Configure live TUI refresh interval |
+| 命令 | 说明 |
+|------|------|
+| [`codex-auth config live --interval <seconds>`](./docs/commands/config.md) | 配置 live TUI 的刷新间隔 |
 
-## Quick Examples
+## 快速示例
 
 ```shell
 codex-auth list
@@ -105,72 +115,107 @@ codex-auth import /path/to/auth.json --alias personal
 codex-auth list --skip-api
 ```
 
+## macOS 菜单栏 App
+
+仓库包含一个 macOS 菜单栏 App，用于在图形界面中管理账号。它适合需要频繁查看当前账号额度、快速切换账号或启动新 Codex 会话的场景。
+
+主要能力：
+
+- 菜单栏实时显示当前活动账号的 5 小时和 7 天剩余额度。
+- 点击菜单栏图标可查看所有账号、额度刷新时间和账号状态。
+- 支持刷新额度、添加账号、切换账号、设置别名、删除账号。
+- 支持选择目录并打开新的 Codex 会话。
+- 剩余额度低于 20% 时百分比标红，否则标绿。
+
+开发运行：
+
+```bash
+macos/CodexAuthApp/scripts/run-app.sh
+```
+
+安装到桌面：
+
+```bash
+macos/CodexAuthApp/scripts/install-shortcut.sh desktop
+```
+
+安装到 Applications：
+
+```bash
+macos/CodexAuthApp/scripts/install-shortcut.sh applications
+```
+
+更多说明见 [macos/CodexAuthApp/README.md](./macos/CodexAuthApp/README.md)。
+
 ## Codex App
 
 > [!IMPORTANT]
-> The `app` command is **experimental** and may never become a stable feature.
+> `app` 命令仍是实验功能，未来不保证稳定。
 >
-> It is designed to enable seamless account switching without restarting the Codex App. By leveraging the `CODEX_CLI_PATH` environment variable, it dynamically injects our managed codext CLI to handle authentication on the fly.
+> 它用于在不重启 Codex App 的情况下尽量实现账号切换。该能力依赖 `CODEX_CLI_PATH` 环境变量，把托管的 `codext` CLI 注入到 Codex App 的认证流程中。
 >
-> The `app` command is constrained by ongoing changes in the official Codex App and [Codex CLI](https://github.com/openai/codex). It may not always take effect and may also break your app.
+> 由于官方 Codex App 和 [Codex CLI](https://github.com/openai/codex) 仍在变化，该命令可能无法生效，也可能导致 App 行为异常。
 
-| Command | Description |
-|---------|-------------|
-| [`codex-auth app [--id <id>] [--codex-cli-path <path>]`](./docs/commands/app.md) | Experimental: launch Codex App with detected defaults, CODEX_HOME, CODEX_CLI_PATH, and platform overrides |
+| 命令 | 说明 |
+|------|------|
+| [`codex-auth app [--id <id>] [--codex-cli-path <path>]`](./docs/commands/app.md) | 实验功能：用检测到的默认值、`CODEX_HOME`、`CODEX_CLI_PATH` 和平台参数启动 Codex App |
 
-Support seamless account switching including:
+目标支持以下场景的无缝账号切换：
 
-- New Chat
-- Restoring or resuming an existing conversation
-- Continuing a previously completed, interrupted, or manually stopped conversation
+- 新建对话
+- 恢复或继续已有对话
+- 继续已经完成、中断或手动停止的对话
 
-### Uninstall
+## 卸载
 
-Remove the npm package:
+移除 npm 包：
 
 ```shell
 npm uninstall -g @loongphy/codex-auth
 ```
 
-## Q&A
+## 常见问题
 
-### Why is my usage limit not refreshing?
+### 为什么额度没有刷新？
 
-API-backed refresh is the default. When you pass `--skip-api`, `codex-auth` reads the newest `~/.codex/sessions/**/rollout-*.jsonl` file instead. Recent Codex builds often write `token_count` events with `rate_limits: null`. The local files may still contain older usable usage limit data, but in practice they can lag by several hours, so local-only refresh may show a usage limit snapshot from hours ago instead of your latest state.
+默认情况下，`codex-auth` 会通过 API 刷新额度。如果传入 `--skip-api`，工具会改为扫描本地 `~/.codex/sessions/**/rollout-*.jsonl` 文件。近期 Codex 版本经常写入 `rate_limits: null` 的 `token_count` 事件。本地文件可能仍有旧的可用额度数据，但实际可能滞后数小时。
 
-- Upstream Codex issue: [openai/codex#14880](https://github.com/openai/codex/issues/14880)
+- 上游 Codex issue：[openai/codex#14880](https://github.com/openai/codex/issues/14880)
 
-Run the API-backed default with:
+使用默认 API 刷新：
 
 ```shell
 codex-auth list
 ```
 
-Run one local-only command with:
+只运行一次本地扫描：
 
 ```shell
 codex-auth list --skip-api
 ```
 
-Verify with:
+可用下面命令触发 Codex 生成新的本地事件后再检查：
 
 ```shell
 codex exec "say hello"
 ```
 
-## Disclaimer
+## 免责声明
 
-This project is provided as-is and use is at your own risk.
+本项目按现状提供，使用风险由你自行承担。
 
-**Usage Data Refresh Source:**
-`codex-auth` supports two sources for refreshing account usage/usage limit information:
+**额度数据刷新来源：**
 
-1. **API (default):** The tool makes direct HTTPS requests to OpenAI's endpoints using your account's access token. This enables both usage refresh and team name refresh. `curl` must be available at runtime.
-2. **Local-only:** With per-command `--skip-api`, the tool scans local `~/.codex/sessions/*/rollout-*.jsonl` files for usage data and skips team name refresh API calls. This mode is safer, but it can be less accurate because recent Codex rollout files often contain `rate_limits: null`, so the latest local usage limit data may lag by several hours.
+`codex-auth` 支持两种额度刷新来源：
 
-**API Call Declaration:**
-By using the default API-backed refresh, this tool will send your ChatGPT access token to OpenAI's servers for usage limit and team name refresh. The exact endpoints are:
+1. **API（默认）：** 工具会使用账号 access token 直接请求 OpenAI 相关接口，以刷新额度和团队名称。运行环境需要可用的 `curl`。
+2. **仅本地：** 使用单次命令参数 `--skip-api` 时，工具会扫描本地 `~/.codex/sessions/*/rollout-*.jsonl` 文件，并跳过团队名称刷新 API。这个模式更保守，但可能不够准确，因为近期 Codex rollout 文件经常包含 `rate_limits: null`，导致本地额度数据滞后。
+
+**API 调用说明：**
+
+使用默认 API 刷新时，工具会把你的 ChatGPT access token 发送到 OpenAI 服务器，用于额度和团队名称刷新。当前涉及的接口包括：
+
 - `GET https://chatgpt.com/backend-api/wham/usage`
 - `GET https://chatgpt.com/backend-api/accounts`
 
-This behavior may be detected by OpenAI and could violate their terms of service, potentially leading to account suspension or other risks. The decision to use this feature and any resulting consequences are entirely yours.
+该行为可能被 OpenAI 检测到，并可能违反其服务条款，进而带来账号限制、暂停或其他风险。是否使用该功能以及由此产生的后果，均由你自行承担。
