@@ -3,6 +3,8 @@ import Foundation
 
 @MainActor
 final class AppState: ObservableObject {
+    nonisolated static let defaultPeriodicRefreshIntervalNanoseconds: UInt64 = 60_000_000_000
+
     @Published private(set) var state: CodexAuthState?
     @Published private(set) var isLoading = false
     @Published var errorMessage: String?
@@ -11,9 +13,14 @@ final class AppState: ObservableObject {
 
     private let client: CodexAuthClientProtocol
     private var didRefreshOnAppLaunch = false
+    private var periodicRefreshTask: Task<Void, Never>?
 
     init(client: CodexAuthClientProtocol = CodexAuthCLIClient()) {
         self.client = client
+    }
+
+    deinit {
+        periodicRefreshTask?.cancel()
     }
 
     var isShowingDeleteConfirmation: Bool {
@@ -33,6 +40,32 @@ final class AppState: ObservableObject {
     }
 
     func refreshOnMenuOpen(apiMode: CodexAuthAPIMode = .automatic) async {
+        guard !isLoading else {
+            return
+        }
+        await refreshUsage(apiMode: apiMode)
+    }
+
+    func startPeriodicRefresh(
+        intervalNanoseconds: UInt64 = AppState.defaultPeriodicRefreshIntervalNanoseconds,
+        apiMode: CodexAuthAPIMode = .automatic
+    ) {
+        guard periodicRefreshTask == nil else {
+            return
+        }
+
+        periodicRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: intervalNanoseconds)
+                if Task.isCancelled {
+                    break
+                }
+                await self?.refreshOnPeriodicTimer(apiMode: apiMode)
+            }
+        }
+    }
+
+    func refreshOnPeriodicTimer(apiMode: CodexAuthAPIMode = .automatic) async {
         guard !isLoading else {
             return
         }

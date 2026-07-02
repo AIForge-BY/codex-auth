@@ -148,6 +148,16 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(client.refreshCallCount, 2)
         XCTAssertEqual(client.loadStateCallCount, 0)
     }
+
+    func testPeriodicRefreshTickRunsUsageRefresh() async {
+        let client = StubCodexAuthClient(state: .empty(codexHome: "/tmp/codex"))
+        let appState = AppState(client: client)
+
+        await appState.refreshOnPeriodicTimer()
+
+        XCTAssertEqual(client.refreshCallCount, 1)
+        XCTAssertEqual(client.loadStateCallCount, 0)
+    }
 }
 
 final class StubCodexAuthClient: CodexAuthClientProtocol {

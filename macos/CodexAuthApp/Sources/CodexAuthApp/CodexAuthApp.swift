@@ -10,6 +10,7 @@ struct CodexAuthMenuApp: App {
         _appState = StateObject(wrappedValue: appState)
         _statusItemController = StateObject(wrappedValue: StatusItemController(appState: appState))
         Task { @MainActor in
+            appState.startPeriodicRefresh()
             await appState.refreshOnAppLaunch()
         }
     }
