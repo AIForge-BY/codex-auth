@@ -104,7 +104,32 @@ struct CodexAuthCLIClient: CodexAuthClientProtocol {
                 "--working-directory=\(directoryPath)",
                 "-e",
                 "codex",
+                "resume",
+                "--last",
             ]
+        )
+        guard result.exitCode == 0 else {
+            let stderr = String(data: result.standardError, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let stdout = String(data: result.standardOutput, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw CodexAuthCLIError.commandFailed(stderr?.isEmpty == false ? stderr! : (stdout ?? "unknown error"))
+        }
+
+        try await activateGhostty()
+    }
+
+    private func openNewTerminalCodexSession(at directoryPath: String) async throws {
+        let script = """
+        set targetPath to \(appleScriptStringLiteral(directoryPath))
+        tell application "Terminal"
+            activate
+            do script "cd " & quoted form of targetPath & " && codex resume --last"
+        end tell
+        """
+        let result = try await runner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/osascript"),
+            arguments: ["-e", script]
         )
         guard result.exitCode == 0 else {
             let stderr = String(data: result.standardError, encoding: .utf8)?
@@ -115,17 +140,10 @@ struct CodexAuthCLIClient: CodexAuthClientProtocol {
         }
     }
 
-    private func openNewTerminalCodexSession(at directoryPath: String) async throws {
-        let script = """
-        set targetPath to \(appleScriptStringLiteral(directoryPath))
-        tell application "Terminal"
-            activate
-            do script "cd " & quoted form of targetPath & " && codex"
-        end tell
-        """
+    private func activateGhostty() async throws {
         let result = try await runner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/osascript"),
-            arguments: ["-e", script]
+            arguments: ["-e", #"tell application "Ghostty" to activate"#]
         )
         guard result.exitCode == 0 else {
             let stderr = String(data: result.standardError, encoding: .utf8)?

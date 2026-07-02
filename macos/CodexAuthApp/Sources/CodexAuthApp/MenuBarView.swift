@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MenuBarView: View {
     @EnvironmentObject private var appState: AppState
+    var closeMenu: @MainActor () -> Void = {}
     @State private var isManagingAccounts = false
     @State private var isAddingAccount = false
     @State private var newAccountAlias = ""
@@ -163,11 +164,12 @@ struct MenuBarView: View {
 
     @MainActor
     private func openCodexSessionAfterChoosingDirectory() {
-        CodexDirectoryPicker.chooseDirectory { directoryPath in
-            guard let directoryPath else {
-                return
+        CodexSessionMenuAction(
+            closeMenu: closeMenu,
+            chooseDirectory: CodexDirectoryPicker.chooseDirectory,
+            openSession: { directoryPath in
+                Task { await appState.openNewCodexSession(at: directoryPath) }
             }
-            Task { await appState.openNewCodexSession(at: directoryPath) }
-        }
+        ).run()
     }
 }

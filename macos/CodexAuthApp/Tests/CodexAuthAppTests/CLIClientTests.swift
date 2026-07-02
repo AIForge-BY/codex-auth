@@ -84,6 +84,46 @@ final class CLIClientTests: XCTestCase {
 
         try await client.openNewCodexSession(at: "/Users/me/project")
 
+        guard runner.calls.count == 2 else {
+            XCTFail("Expected Ghostty open followed by activation, got \(runner.calls)")
+            return
+        }
+        XCTAssertEqual(runner.calls[0], CommandCall(
+            executable: "/usr/bin/open",
+            arguments: [
+                "-na",
+                "/Applications/Ghostty.app",
+                "--args",
+                "--working-directory=/Users/me/project",
+                "-e",
+                "codex",
+                "resume",
+                "--last",
+            ]
+        ))
+        XCTAssertEqual(runner.calls[1].executable, "/usr/bin/osascript")
+        XCTAssertEqual(runner.calls[1].arguments.first, "-e")
+        XCTAssertTrue(runner.calls[1].arguments[1].contains("tell application \"Ghostty\""))
+        XCTAssertTrue(runner.calls[1].arguments[1].contains("activate"))
+    }
+
+    func testClientDoesNotActivateGhosttyWhenOpenFails() async {
+        let runner = RecordingCommandRunner(exitCode: 1, output: "", errorOutput: "open failed")
+        let client = CodexAuthCLIClient(
+            executableURL: URL(fileURLWithPath: "/usr/local/bin/codex-auth"),
+            runner: runner,
+            fileExists: { $0.path == "/Applications/Ghostty.app" }
+        )
+
+        do {
+            try await client.openNewCodexSession(at: "/Users/me/project")
+            XCTFail("Expected open failure")
+        } catch let error as CodexAuthCLIError {
+            XCTAssertEqual(error.localizedDescription, "命令执行失败：open failed")
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
         XCTAssertEqual(runner.calls, [
             CommandCall(
                 executable: "/usr/bin/open",
@@ -94,6 +134,8 @@ final class CLIClientTests: XCTestCase {
                     "--working-directory=/Users/me/project",
                     "-e",
                     "codex",
+                    "resume",
+                    "--last",
                 ]
             )
         ])
@@ -115,7 +157,7 @@ final class CLIClientTests: XCTestCase {
         XCTAssertTrue(runner.calls[0].arguments[1].contains("tell application \"Terminal\""))
         XCTAssertTrue(runner.calls[0].arguments[1].contains("quoted form of targetPath"))
         XCTAssertTrue(runner.calls[0].arguments[1].contains("set targetPath to \"/Users/me/project\""))
-        XCTAssertTrue(runner.calls[0].arguments[1].contains("&& codex"))
+        XCTAssertTrue(runner.calls[0].arguments[1].contains("&& codex resume --last"))
     }
 }
 

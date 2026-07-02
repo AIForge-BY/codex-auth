@@ -124,7 +124,7 @@ final class AppStateTests: XCTestCase {
         await appState.openNewCodexSession(at: "/Users/me/project")
 
         XCTAssertEqual(client.openedSessionDirectoryPath, "/Users/me/project")
-        XCTAssertEqual(appState.notice, "已在 Ghostty 打开新的 Codex 会话。")
+        XCTAssertEqual(appState.notice, "已打开 Codex，会恢复最近会话或创建新会话。")
     }
 
     func testRefreshOnAppLaunchRunsUsageRefreshOnlyOnce() async {

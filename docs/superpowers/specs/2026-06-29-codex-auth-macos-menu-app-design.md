@@ -119,7 +119,7 @@ All GUI text is Chinese. Example labels:
 
 After switching, the UI immediately updates the active account from the command result. The success message states that new Codex CLI sessions will use the selected account. The app does not claim that existing terminal sessions are updated.
 
-The app provides a nearby `新建 Codex 会话` action. On macOS it asks the user to choose a working directory, then opens Ghostty and runs `codex` in that directory.
+The app provides a nearby `新建 Codex 会话` action. On macOS it asks the user to choose a working directory, then opens Ghostty and asks Codex to resume the latest session for that directory, falling back to a new session when Codex has nothing to resume.
 
 ## Error Handling
 

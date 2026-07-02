@@ -34,7 +34,8 @@ macos/CodexAuthApp/scripts/clean.sh
 
 - App 会优先使用打包在 `.app` 内的 `codex-auth` CLI。
 - 打包脚本会生成 macOS `.icns` 应用图标。
-- “新会话”会先选择工作目录，然后优先用 Ghostty 打开 `codex`。
+- “新会话”会先选择工作目录，然后优先用 Ghostty 恢复该目录最近的 Codex 会话；没有可恢复会话时会进入新的 Codex 会话。
+- 打开 Ghostty 后会激活新终端窗口到前台。
 - 如果没有安装 Ghostty，会回退到 macOS Terminal。
 - 切换账号只影响新的 Codex CLI 会话；已打开的旧命令行会话不会自动切换账号。
 - 菜单栏图标旁会以紧凑两行显示当前活动账号的 5 小时和 7 天剩余额度，并每 60 秒自动刷新。

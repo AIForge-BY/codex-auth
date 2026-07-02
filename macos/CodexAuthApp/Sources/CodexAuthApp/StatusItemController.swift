@@ -64,7 +64,9 @@ final class StatusItemController: NSObject, ObservableObject {
         popover.contentSize = NSSize(width: 420, height: 1)
         popover.delegate = self
         popover.contentViewController = NSHostingController(
-            rootView: MenuBarView()
+            rootView: MenuBarView(closeMenu: { [weak self] in
+                self?.closePopover()
+            })
                 .environmentObject(appState)
                 .frame(width: 420)
                 .fixedSize(horizontal: false, vertical: true)

@@ -145,7 +145,7 @@ final class AppState: ObservableObject {
     func openNewCodexSession(at directoryPath: String) async {
         do {
             try await client.openNewCodexSession(at: directoryPath)
-            notice = "已在 Ghostty 打开新的 Codex 会话。"
+            notice = "已打开 Codex，会恢复最近会话或创建新会话。"
         } catch {
             errorMessage = error.localizedDescription
         }
