@@ -15,10 +15,8 @@ struct CodexAuthMenuApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("管理账号", id: "manage-accounts") {
-            ManageAccountsView()
-                .environmentObject(appState)
-                .frame(minWidth: 760, minHeight: 480)
+        Settings {
+            EmptyView()
         }
     }
 }
