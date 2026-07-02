@@ -102,10 +102,7 @@ struct CodexAuthCLIClient: CodexAuthClientProtocol {
                 Self.ghosttyAppURL.path,
                 "--args",
                 "--working-directory=\(directoryPath)",
-                "-e",
-                "codex",
-                "resume",
-                "--last",
+                "--input=codex resume --last\n",
             ]
         )
         guard result.exitCode == 0 else {
@@ -115,8 +112,6 @@ struct CodexAuthCLIClient: CodexAuthClientProtocol {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             throw CodexAuthCLIError.commandFailed(stderr?.isEmpty == false ? stderr! : (stdout ?? "unknown error"))
         }
-
-        try await activateGhostty()
     }
 
     private func openNewTerminalCodexSession(at directoryPath: String) async throws {
@@ -130,20 +125,6 @@ struct CodexAuthCLIClient: CodexAuthClientProtocol {
         let result = try await runner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/osascript"),
             arguments: ["-e", script]
-        )
-        guard result.exitCode == 0 else {
-            let stderr = String(data: result.standardError, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let stdout = String(data: result.standardOutput, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            throw CodexAuthCLIError.commandFailed(stderr?.isEmpty == false ? stderr! : (stdout ?? "unknown error"))
-        }
-    }
-
-    private func activateGhostty() async throws {
-        let result = try await runner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/osascript"),
-            arguments: ["-e", #"tell application "Ghostty" to activate"#]
         )
         guard result.exitCode == 0 else {
             let stderr = String(data: result.standardError, encoding: .utf8)?

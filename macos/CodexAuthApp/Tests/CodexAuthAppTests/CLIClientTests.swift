@@ -84,8 +84,8 @@ final class CLIClientTests: XCTestCase {
 
         try await client.openNewCodexSession(at: "/Users/me/project")
 
-        guard runner.calls.count == 2 else {
-            XCTFail("Expected Ghostty open followed by activation, got \(runner.calls)")
+        guard runner.calls.count == 1 else {
+            XCTFail("Expected only Ghostty open, got \(runner.calls)")
             return
         }
         XCTAssertEqual(runner.calls[0], CommandCall(
@@ -95,16 +95,9 @@ final class CLIClientTests: XCTestCase {
                 "/Applications/Ghostty.app",
                 "--args",
                 "--working-directory=/Users/me/project",
-                "-e",
-                "codex",
-                "resume",
-                "--last",
+                "--input=codex resume --last\n",
             ]
         ))
-        XCTAssertEqual(runner.calls[1].executable, "/usr/bin/osascript")
-        XCTAssertEqual(runner.calls[1].arguments.first, "-e")
-        XCTAssertTrue(runner.calls[1].arguments[1].contains("tell application \"Ghostty\""))
-        XCTAssertTrue(runner.calls[1].arguments[1].contains("activate"))
     }
 
     func testClientDoesNotActivateGhosttyWhenOpenFails() async {
@@ -132,10 +125,7 @@ final class CLIClientTests: XCTestCase {
                     "/Applications/Ghostty.app",
                     "--args",
                     "--working-directory=/Users/me/project",
-                    "-e",
-                    "codex",
-                    "resume",
-                    "--last",
+                    "--input=codex resume --last\n",
                 ]
             )
         ])
