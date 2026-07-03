@@ -95,15 +95,22 @@ struct CodexAuthCLIClient: CodexAuthClientProtocol {
             return
         }
 
+        let script = """
+        set targetPath to \(appleScriptStringLiteral(directoryPath))
+        set initialCommand to "codex resume --last" & linefeed
+        tell application "Ghostty"
+            activate
+            set surfaceConfig to new surface configuration from {initial working directory:targetPath, initial input:initialCommand}
+            if (count of windows) is 0 then
+                new window with configuration surfaceConfig
+            else
+                new tab in front window with configuration surfaceConfig
+            end if
+        end tell
+        """
         let result = try await runner.run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/open"),
-            arguments: [
-                "-na",
-                Self.ghosttyAppURL.path,
-                "--args",
-                "--working-directory=\(directoryPath)",
-                "--input=codex resume --last\n",
-            ]
+            executableURL: URL(fileURLWithPath: "/usr/bin/osascript"),
+            arguments: ["-e", script]
         )
         guard result.exitCode == 0 else {
             let stderr = String(data: result.standardError, encoding: .utf8)?

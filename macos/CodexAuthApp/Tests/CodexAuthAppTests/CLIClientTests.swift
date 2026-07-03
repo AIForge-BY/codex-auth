@@ -74,7 +74,7 @@ final class CLIClientTests: XCTestCase {
         XCTAssertEqual(resolver.resolve().path, "/repo/zig-out/bin/codex-auth")
     }
 
-    func testClientOpensCodexSessionInGhosttyAtDirectory() async throws {
+    func testClientOpensCodexSessionInGhosttyTabAtDirectory() async throws {
         let runner = RecordingCommandRunner(output: "")
         let client = CodexAuthCLIClient(
             executableURL: URL(fileURLWithPath: "/usr/local/bin/codex-auth"),
@@ -85,22 +85,23 @@ final class CLIClientTests: XCTestCase {
         try await client.openNewCodexSession(at: "/Users/me/project")
 
         guard runner.calls.count == 1 else {
-            XCTFail("Expected only Ghostty open, got \(runner.calls)")
+            XCTFail("Expected only Ghostty AppleScript, got \(runner.calls)")
             return
         }
-        XCTAssertEqual(runner.calls[0], CommandCall(
-            executable: "/usr/bin/open",
-            arguments: [
-                "-na",
-                "/Applications/Ghostty.app",
-                "--args",
-                "--working-directory=/Users/me/project",
-                "--input=codex resume --last\n",
-            ]
-        ))
+        XCTAssertEqual(runner.calls[0].executable, "/usr/bin/osascript")
+        XCTAssertEqual(runner.calls[0].arguments.count, 2)
+        XCTAssertEqual(runner.calls[0].arguments[0], "-e")
+        XCTAssertTrue(runner.calls[0].arguments[1].contains("tell application \"Ghostty\""))
+        XCTAssertTrue(runner.calls[0].arguments[1].contains("activate"))
+        XCTAssertTrue(runner.calls[0].arguments[1].contains("new tab in front window with configuration surfaceConfig"))
+        XCTAssertTrue(runner.calls[0].arguments[1].contains("new window with configuration surfaceConfig"))
+        XCTAssertTrue(runner.calls[0].arguments[1].contains("initial working directory:targetPath"))
+        XCTAssertTrue(runner.calls[0].arguments[1].contains("set initialCommand to \"codex resume --last\" & linefeed"))
+        XCTAssertTrue(runner.calls[0].arguments[1].contains("initial input:initialCommand"))
+        XCTAssertTrue(runner.calls[0].arguments[1].contains("set targetPath to \"/Users/me/project\""))
     }
 
-    func testClientDoesNotActivateGhosttyWhenOpenFails() async {
+    func testClientSurfacesGhosttyAppleScriptFailure() async {
         let runner = RecordingCommandRunner(exitCode: 1, output: "", errorOutput: "open failed")
         let client = CodexAuthCLIClient(
             executableURL: URL(fileURLWithPath: "/usr/local/bin/codex-auth"),
@@ -117,18 +118,10 @@ final class CLIClientTests: XCTestCase {
             XCTFail("Unexpected error: \(error)")
         }
 
-        XCTAssertEqual(runner.calls, [
-            CommandCall(
-                executable: "/usr/bin/open",
-                arguments: [
-                    "-na",
-                    "/Applications/Ghostty.app",
-                    "--args",
-                    "--working-directory=/Users/me/project",
-                    "--input=codex resume --last\n",
-                ]
-            )
-        ])
+        XCTAssertEqual(runner.calls.count, 1)
+        XCTAssertEqual(runner.calls[0].executable, "/usr/bin/osascript")
+        XCTAssertEqual(runner.calls[0].arguments.first, "-e")
+        XCTAssertTrue(runner.calls[0].arguments[1].contains("tell application \"Ghostty\""))
     }
 
     func testClientFallsBackToTerminalWhenGhosttyIsMissing() async throws {
