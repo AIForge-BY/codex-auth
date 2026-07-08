@@ -230,6 +230,7 @@ struct ProcessCommandRunner: CommandRunning {
         let process = Process()
         process.executableURL = executableURL
         process.arguments = arguments
+        process.environment = CommandEnvironmentBuilder.environment()
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -244,5 +245,25 @@ struct ProcessCommandRunner: CommandRunning {
             standardOutput: stdout.fileHandleForReading.readDataToEndOfFile(),
             standardError: stderr.fileHandleForReading.readDataToEndOfFile()
         )
+    }
+}
+
+struct CommandEnvironmentBuilder {
+    private static let commonExecutableDirectories = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+    ]
+
+    static func environment(from base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+        var environment = base
+        let existingPath = environment["PATH"] ?? ""
+        var entries = existingPath.split(separator: ":").map(String.init)
+
+        for directory in commonExecutableDirectories where !entries.contains(directory) {
+            entries.append(directory)
+        }
+
+        environment["PATH"] = entries.joined(separator: ":")
+        return environment
     }
 }

@@ -14,6 +14,7 @@ final class AppState: ObservableObject {
     private let client: CodexAuthClientProtocol
     private var didRefreshOnAppLaunch = false
     private var periodicRefreshTask: Task<Void, Never>?
+    private var loadSequence = 0
 
     init(client: CodexAuthClientProtocol = CodexAuthCLIClient()) {
         self.client = client
@@ -152,13 +153,24 @@ final class AppState: ObservableObject {
     }
 
     private func load(_ operation: () async throws -> CodexAuthState) async {
+        loadSequence += 1
+        let sequence = loadSequence
         isLoading = true
         errorMessage = nil
-        defer { isLoading = false }
+        defer {
+            if sequence == loadSequence {
+                isLoading = false
+            }
+        }
         do {
-            state = try await operation()
+            let loadedState = try await operation()
+            if sequence == loadSequence {
+                state = loadedState
+            }
         } catch {
-            errorMessage = error.localizedDescription
+            if sequence == loadSequence {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 }

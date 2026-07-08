@@ -74,6 +74,22 @@ final class CLIClientTests: XCTestCase {
         XCTAssertEqual(resolver.resolve().path, "/repo/zig-out/bin/codex-auth")
     }
 
+    func testCommandEnvironmentAddsCommonCodexInstallDirectoriesToPath() {
+        let environment = CommandEnvironmentBuilder.environment(
+            from: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+        )
+
+        XCTAssertEqual(environment["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin")
+    }
+
+    func testCommandEnvironmentDoesNotDuplicateExistingPathEntries() {
+        let environment = CommandEnvironmentBuilder.environment(
+            from: ["PATH": "/opt/homebrew/bin:/usr/bin:/bin"]
+        )
+
+        XCTAssertEqual(environment["PATH"], "/opt/homebrew/bin:/usr/bin:/bin:/usr/local/bin")
+    }
+
     func testClientOpensCodexSessionInGhosttyTabAtDirectory() async throws {
         let runner = RecordingCommandRunner(output: "")
         let client = CodexAuthCLIClient(

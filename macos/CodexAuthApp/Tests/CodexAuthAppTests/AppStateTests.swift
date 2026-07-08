@@ -158,6 +158,45 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(client.refreshCallCount, 1)
         XCTAssertEqual(client.loadStateCallCount, 0)
     }
+
+    func testSwitchResultIsNotOverwrittenByOlderRefresh() async {
+        let original = CodexAuthState(
+            schemaVersion: 1,
+            codexHome: "/tmp/codex",
+            activeAccountKey: "acct-1",
+            generatedAt: Date(timeIntervalSince1970: 0),
+            refresh: RefreshInfo(attempted: false, status: "skipped", message: nil),
+            warnings: [],
+            accounts: [
+                CodexAccount.sample(accountKey: "acct-1", alias: "原账号", isActive: true),
+                CodexAccount.sample(accountKey: "acct-2", alias: "新账号", isActive: false),
+            ]
+        )
+        let switched = CodexAuthState(
+            schemaVersion: 1,
+            codexHome: "/tmp/codex",
+            activeAccountKey: "acct-2",
+            generatedAt: Date(timeIntervalSince1970: 1),
+            refresh: RefreshInfo(attempted: false, status: "skipped", message: nil),
+            warnings: [],
+            accounts: [
+                CodexAccount.sample(accountKey: "acct-1", alias: "原账号", isActive: false),
+                CodexAccount.sample(accountKey: "acct-2", alias: "新账号", isActive: true),
+            ]
+        )
+        let client = DelayedRefreshCodexAuthClient(refreshState: original, switchState: switched)
+        let appState = AppState(client: client)
+
+        let refreshTask = Task { await appState.refreshOnMenuOpen() }
+        await client.waitUntilRefreshStarted()
+
+        await appState.switchAccount(accountKey: "acct-2")
+        client.finishRefresh()
+        await refreshTask.value
+
+        XCTAssertEqual(appState.state?.activeAccountKey, "acct-2")
+        XCTAssertEqual(appState.notice, "已切换账号。新的 Codex CLI 会话将使用此账号。")
+    }
 }
 
 final class StubCodexAuthClient: CodexAuthClientProtocol {
@@ -214,4 +253,70 @@ final class StubCodexAuthClient: CodexAuthClientProtocol {
     func openNewCodexSession(at directoryPath: String) async throws {
         openedSessionDirectoryPath = directoryPath
     }
+}
+
+@MainActor
+final class DelayedRefreshCodexAuthClient: CodexAuthClientProtocol {
+    let refreshState: CodexAuthState
+    let switchState: CodexAuthState
+    private var refreshContinuation: CheckedContinuation<Void, Never>?
+    private var refreshStartedContinuation: CheckedContinuation<Void, Never>?
+
+    init(refreshState: CodexAuthState, switchState: CodexAuthState) {
+        self.refreshState = refreshState
+        self.switchState = switchState
+    }
+
+    func waitUntilRefreshStarted() async {
+        if refreshContinuation != nil {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            refreshStartedContinuation = continuation
+        }
+    }
+
+    func finishRefresh() {
+        refreshContinuation?.resume()
+        refreshContinuation = nil
+    }
+
+    func loadState(apiMode: CodexAuthAPIMode) async throws -> CodexAuthState {
+        refreshState
+    }
+
+    func refresh(apiMode: CodexAuthAPIMode) async throws -> CodexAuthState {
+        await withCheckedContinuation { continuation in
+            refreshContinuation = continuation
+            refreshStartedContinuation?.resume()
+            refreshStartedContinuation = nil
+        }
+        return refreshState
+    }
+
+    func switchAccount(accountKey: String) async throws -> CodexAuthState {
+        switchState
+    }
+
+    func removeAccount(accountKey: String) async throws -> CodexAuthState {
+        refreshState
+    }
+
+    func setAlias(accountKey: String, alias: String) async throws -> CodexAuthState {
+        refreshState
+    }
+
+    func clearAlias(accountKey: String) async throws -> CodexAuthState {
+        refreshState
+    }
+
+    func login() async throws -> CodexAuthState {
+        refreshState
+    }
+
+    func importAuth(path: String, alias: String?) async throws -> CodexAuthState {
+        refreshState
+    }
+
+    func openNewCodexSession(at directoryPath: String) async throws {}
 }
