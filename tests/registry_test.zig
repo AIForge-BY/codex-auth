@@ -412,6 +412,46 @@ test "resolveDisplayPlan prefers a usage snapshot plan over the stored auth plan
     try std.testing.expectEqual(registry.PlanType.team, registry.resolveDisplayPlan(&reg.accounts.items[0]).?);
 }
 
+test "resolveRateWindow rejects explicit mismatched secondary window" {
+    const usage: registry.RateLimitSnapshot = .{
+        .primary = .{
+            .used_percent = 1,
+            .window_minutes = 300,
+            .resets_at = 4102444800,
+        },
+        .secondary = .{
+            .used_percent = 93,
+            .window_minutes = 1440,
+            .resets_at = 4102531200,
+        },
+        .credits = null,
+        .plan_type = .plus,
+    };
+
+    try std.testing.expect(registry.resolveRateWindow(usage, 10080, false) == null);
+    try std.testing.expectEqual(@as(f64, 1), registry.resolveRateWindow(usage, 300, true).?.used_percent);
+}
+
+test "resolveRateWindow keeps positional fallback for legacy snapshots" {
+    const usage: registry.RateLimitSnapshot = .{
+        .primary = .{
+            .used_percent = 4,
+            .window_minutes = null,
+            .resets_at = 4102444800,
+        },
+        .secondary = .{
+            .used_percent = 8,
+            .window_minutes = null,
+            .resets_at = 4103049600,
+        },
+        .credits = null,
+        .plan_type = .plus,
+    };
+
+    try std.testing.expectEqual(@as(f64, 4), registry.resolveRateWindow(usage, 300, true).?.used_percent);
+    try std.testing.expectEqual(@as(f64, 8), registry.resolveRateWindow(usage, 10080, false).?.used_percent);
+}
+
 test "registry load defaults missing account_name field to null" {
     const gpa = std.testing.allocator;
     var tmp = fs.tmpDir(.{});

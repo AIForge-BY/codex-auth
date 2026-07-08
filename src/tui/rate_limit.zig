@@ -19,12 +19,17 @@ const ResetParts = struct {
 
 pub fn resolveRateWindow(usage: ?registry.RateLimitSnapshot, minutes: i64, fallback_primary: bool) ?registry.RateLimitWindow {
     if (usage == null) return null;
+    var has_explicit_window_minutes = false;
     if (usage.?.primary) |p| {
+        has_explicit_window_minutes = has_explicit_window_minutes or p.window_minutes != null;
         if (p.window_minutes != null and p.window_minutes.? == minutes) return p;
     }
     if (usage.?.secondary) |s| {
+        has_explicit_window_minutes = has_explicit_window_minutes or s.window_minutes != null;
         if (s.window_minutes != null and s.window_minutes.? == minutes) return s;
     }
+    // 仅在旧快照完全没有窗口长度时按位置兜底，避免把非 7 天窗口误显示为 7 天。
+    if (has_explicit_window_minutes) return null;
     return if (fallback_primary) usage.?.primary else usage.?.secondary;
 }
 

@@ -271,9 +271,9 @@ private extension UsageTone {
     func statusItemColor(forActiveMenuBar activeMenuBar: Bool) -> NSColor {
         switch self {
         case .available:
-            return activeMenuBar ? NSColor(calibratedRed: 0.76, green: 1.0, blue: 0.64, alpha: 1) : .systemGreen
+            return activeMenuBar ? NSColor(calibratedRed: 0.62, green: 0.82, blue: 0.58, alpha: 1) : NSColor(calibratedRed: 0.18, green: 0.52, blue: 0.32, alpha: 1)
         case .low:
-            return activeMenuBar ? NSColor(calibratedRed: 1.0, green: 0.70, blue: 0.70, alpha: 1) : .systemRed
+            return activeMenuBar ? NSColor(calibratedRed: 0.92, green: 0.58, blue: 0.54, alpha: 1) : NSColor(calibratedRed: 0.78, green: 0.18, blue: 0.16, alpha: 1)
         case .unavailable:
             return activeMenuBar ? NSColor.white.withAlphaComponent(0.72) : .secondaryLabelColor
         }
