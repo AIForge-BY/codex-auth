@@ -31,18 +31,28 @@ fn handleState(
         try registry.saveRegistry(allocator, codex_home, &reg);
     }
     const attempted = force_refresh;
+    var refresh_state: ?usage_refresh.ForegroundUsageRefreshState = null;
+    defer if (refresh_state) |*state| state.deinit(allocator);
+
     if (force_refresh) {
         const usage_api_enabled = apiModeUsesApi(reg.api.usage, opts.api_mode);
-        var refresh_state = try usage_refresh.refreshForegroundUsageForDisplayWithBatchFetcherUsingApiEnabledAndActiveOnly(
+        refresh_state = try usage_refresh.refreshForegroundUsageForDisplayWithBatchFetcherUsingApiEnabledAndActiveOnly(
             allocator,
             codex_home,
             &reg,
             usage_api_enabled,
             opts.active_only,
         );
-        defer refresh_state.deinit(allocator);
     }
-    try writeStateJson(allocator, codex_home, &reg, attempted, if (attempted) "ok" else "skipped", null);
+    try writeStateJson(
+        allocator,
+        codex_home,
+        &reg,
+        attempted,
+        if (attempted) "ok" else "skipped",
+        null,
+        if (refresh_state) |state| state.usage_overrides else null,
+    );
 }
 
 fn handleSwitch(allocator: std.mem.Allocator, codex_home: []const u8, account_key: []const u8) !void {
@@ -53,14 +63,14 @@ fn handleSwitch(allocator: std.mem.Allocator, codex_home: []const u8, account_ke
     }
     try registry.activateAccountByKey(allocator, codex_home, &reg, account_key);
     try registry.saveRegistry(allocator, codex_home, &reg);
-    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null);
+    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null);
 }
 
 fn handleLogin(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.types.LoginOptions) !void {
     try login_workflow.handleLogin(allocator, codex_home, opts);
     var reg = try registry.loadRegistry(allocator, codex_home);
     defer reg.deinit(allocator);
-    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null);
+    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null);
 }
 
 fn handleImport(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.types.GuiImportOptions) !void {
@@ -72,7 +82,7 @@ fn handleImport(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.
         try registry.saveRegistry(allocator, codex_home, &reg);
     }
     if (report.failure != null) return error.ImportFailed;
-    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null);
+    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null);
 }
 
 fn handleRemove(allocator: std.mem.Allocator, codex_home: []const u8, account_key: []const u8) !void {
@@ -81,7 +91,7 @@ fn handleRemove(allocator: std.mem.Allocator, codex_home: []const u8, account_ke
     const idx = registry.findAccountIndexByAccountKey(&reg, account_key) orelse return error.AccountNotFound;
     var selected = [_]usize{idx};
     try live_flow.removeSelectedAccountsAndPersist(allocator, codex_home, &reg, selected[0..], false);
-    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null);
+    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null);
 }
 
 fn handleAlias(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.types.GuiAliasOptions) !void {
@@ -99,9 +109,10 @@ fn handleAlias(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.t
         },
     }
     try registry.saveRegistry(allocator, codex_home, &reg);
-    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null);
+    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null);
 }
 
+// 输出 macOS GUI 使用的状态 JSON，并把本轮刷新失败状态合并到展示层用量字段中。
 fn writeStateJson(
     allocator: std.mem.Allocator,
     codex_home: []const u8,
@@ -109,6 +120,7 @@ fn writeStateJson(
     refresh_attempted: bool,
     refresh_status: []const u8,
     refresh_message: ?[]const u8,
+    usage_overrides: ?[]const ?[]const u8,
 ) !void {
     _ = allocator;
     var stdout: io_util.Stdout = undefined;
@@ -130,13 +142,20 @@ fn writeStateJson(
     try out.writeAll("},\"warnings\":[],\"accounts\":[");
     for (reg.accounts.items, 0..) |rec, idx| {
         if (idx != 0) try out.writeAll(",");
-        try writeAccountJson(out, reg, &rec, now);
+        try writeAccountJson(out, reg, &rec, now, usageOverrideForAccount(usage_overrides, idx));
     }
     try out.writeAll("]}\n");
     try out.flush();
 }
 
-fn writeAccountJson(out: *std.Io.Writer, reg: *const registry.Registry, rec: *const registry.AccountRecord, now: i64) !void {
+// 输出单个账号的 GUI JSON；usage_override 非空时优先展示刷新失败原因。
+fn writeAccountJson(
+    out: *std.Io.Writer,
+    reg: *const registry.Registry,
+    rec: *const registry.AccountRecord,
+    now: i64,
+    usage_override: ?[]const u8,
+) !void {
     try out.writeAll("{\"account_key\":");
     try writeJsonString(out, rec.account_key);
     try out.writeAll(",\"display_name\":");
@@ -163,9 +182,9 @@ fn writeAccountJson(out: *std.Io.Writer, reg: *const registry.Registry, rec: *co
     try out.print(",\"is_active\":{},", .{is_active});
     try out.writeAll("\"usage\":{");
     try out.writeAll("\"five_hour\":");
-    try writeUsageWindowJson(out, registry.resolveRateWindow(rec.last_usage, 300, true), now);
+    try writeUsageWindowJson(out, registry.resolveRateWindow(rec.last_usage, 300, true), now, usage_override);
     try out.writeAll(",\"seven_day\":");
-    try writeUsageWindowJson(out, registry.resolveRateWindow(rec.last_usage, 10080, false), now);
+    try writeUsageWindowJson(out, registry.resolveRateWindow(rec.last_usage, 10080, false), now, usage_override);
     try out.writeAll("},\"last_usage_at\":");
     try writeOptionalInt(out, rec.last_usage_at);
     try out.writeAll(",\"last_refresh_at\":");
@@ -173,8 +192,19 @@ fn writeAccountJson(out: *std.Io.Writer, reg: *const registry.Registry, rec: *co
     try out.writeAll("}");
 }
 
-fn writeUsageWindowJson(out: *std.Io.Writer, window: ?registry.RateLimitWindow, now: i64) !void {
+// 输出单个用量窗口；刷新失败时用 status 承载可见错误，避免展示过期百分比。
+fn writeUsageWindowJson(
+    out: *std.Io.Writer,
+    window: ?registry.RateLimitWindow,
+    now: i64,
+    usage_override: ?[]const u8,
+) !void {
     try out.writeAll("{\"status\":");
+    if (usage_override) |value| {
+        try writeJsonString(out, value);
+        try out.writeAll(",\"remaining_percent\":null,\"total\":null,\"used\":null,\"reset_at\":null}");
+        return;
+    }
     if (window == null) {
         try writeJsonString(out, "unknown");
         try out.writeAll(",\"remaining_percent\":null,\"total\":null,\"used\":null,\"reset_at\":null}");
@@ -189,6 +219,16 @@ fn writeUsageWindowJson(out: *std.Io.Writer, window: ?registry.RateLimitWindow, 
     try out.writeAll(",\"reset_at\":");
     try writeOptionalInt(out, value.resets_at);
     try out.writeAll("}");
+}
+
+// 读取指定账号的本轮刷新失败状态，越界或未刷新失败时返回 null。
+fn usageOverrideForAccount(
+    usage_overrides: ?[]const ?[]const u8,
+    account_idx: usize,
+) ?[]const u8 {
+    const overrides = usage_overrides orelse return null;
+    if (account_idx >= overrides.len) return null;
+    return overrides[account_idx];
 }
 
 fn displayName(rec: *const registry.AccountRecord) []const u8 {
@@ -272,4 +312,25 @@ fn apiModeUsesApi(default_enabled: bool, mode: cli.types.ApiMode) bool {
         .force_api => true,
         .skip_api => false,
     };
+}
+
+test "writeUsageWindowJson uses override status instead of stale usage" {
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+
+    try writeUsageWindowJson(
+        &writer,
+        .{
+            .used_percent = 34,
+            .window_minutes = 300,
+            .resets_at = 4_102_444_800,
+        },
+        1_800_000_000,
+        "401 token_invalidated",
+    );
+
+    try std.testing.expectEqualStrings(
+        "{\"status\":\"401 token_invalidated\",\"remaining_percent\":null,\"total\":null,\"used\":null,\"reset_at\":null}",
+        writer.buffered(),
+    );
 }

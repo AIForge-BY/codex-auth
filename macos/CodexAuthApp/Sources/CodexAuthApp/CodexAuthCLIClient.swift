@@ -226,25 +226,28 @@ struct CodexAuthExecutableResolver {
 }
 
 struct ProcessCommandRunner: CommandRunning {
+    /// 在后台任务中执行阻塞式进程等待，避免菜单栏 UI 的 MainActor 调用链被卡住。
     func run(executableURL: URL, arguments: [String]) async throws -> CommandResult {
-        let process = Process()
-        process.executableURL = executableURL
-        process.arguments = arguments
-        process.environment = CommandEnvironmentBuilder.environment()
+        try await Task.detached(priority: .userInitiated) {
+            let process = Process()
+            process.executableURL = executableURL
+            process.arguments = arguments
+            process.environment = CommandEnvironmentBuilder.environment()
 
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.standardOutput = stdout
+            process.standardError = stderr
 
-        try process.run()
-        process.waitUntilExit()
+            try process.run()
+            process.waitUntilExit()
 
-        return CommandResult(
-            exitCode: process.terminationStatus,
-            standardOutput: stdout.fileHandleForReading.readDataToEndOfFile(),
-            standardError: stderr.fileHandleForReading.readDataToEndOfFile()
-        )
+            return CommandResult(
+                exitCode: process.terminationStatus,
+                standardOutput: stdout.fileHandleForReading.readDataToEndOfFile(),
+                standardError: stderr.fileHandleForReading.readDataToEndOfFile()
+            )
+        }.value
     }
 }
 

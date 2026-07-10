@@ -95,6 +95,14 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(window.detailText, "缺少认证信息")
     }
 
+    func testUsageOverrideStatusIsDisplayedDirectly() {
+        let window = UsageWindow(status: "401 token_invalidated", remainingPercent: nil, total: nil, used: nil, resetAt: nil)
+
+        XCTAssertEqual(window.displayText, "401 token_invalidated")
+        XCTAssertEqual(window.displayTextWithReset, "401 token_invalidated")
+        XCTAssertEqual(window.menuBarPercentText, "--")
+    }
+
     func testLowUsageThresholdIsBelowTwentyPercent() {
         let low = UsageWindow(status: "ok", remainingPercent: 19, total: 100, used: 81, resetAt: nil)
         let boundary = UsageWindow(status: "ok", remainingPercent: 20, total: 100, used: 80, resetAt: nil)

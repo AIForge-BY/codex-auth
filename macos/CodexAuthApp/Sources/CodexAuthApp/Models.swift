@@ -167,11 +167,15 @@ struct UsageWindow: Decodable, Equatable {
     let used: Int?
     let resetAt: Date?
 
+    /// 将后端返回的刷新失败状态直接展示出来，避免用“未知”掩盖具体错误。
     var displayText: String {
-        guard status == "ok", let remainingPercent else {
-            return "未知"
+        if status == "ok", let remainingPercent {
+            return "\(remainingPercent)%"
         }
-        return "\(remainingPercent)%"
+        if isDisplayOverrideStatus {
+            return status
+        }
+        return "未知"
     }
 
     var menuBarPercentText: String {
@@ -214,6 +218,11 @@ struct UsageWindow: Decodable, Equatable {
             return nil
         }
         return UsageResetDateFormatter.string(from: resetAt)
+    }
+
+    /// 识别后端透传的刷新失败文案，内置状态仍走本地化降级显示。
+    private var isDisplayOverrideStatus: Bool {
+        !["unknown", "missing_auth", "network_error", "http_error"].contains(status) && !status.isEmpty
     }
 
     var detailText: String {
