@@ -192,7 +192,7 @@ fn writeAccountJson(
     try out.writeAll("}");
 }
 
-// 输出单个用量窗口；刷新失败时用 status 承载可见错误，避免展示过期百分比。
+// 输出单个用量窗口；临时超时保留历史值，其他刷新失败用 status 承载可见错误。
 fn writeUsageWindowJson(
     out: *std.Io.Writer,
     window: ?registry.RateLimitWindow,
@@ -201,9 +201,12 @@ fn writeUsageWindowJson(
 ) !void {
     try out.writeAll("{\"status\":");
     if (usage_override) |value| {
-        try writeJsonString(out, value);
-        try out.writeAll(",\"remaining_percent\":null,\"total\":null,\"used\":null,\"reset_at\":null}");
-        return;
+        const should_keep_stale_usage = window != null and std.mem.eql(u8, value, "TimedOut");
+        if (!should_keep_stale_usage) {
+            try writeJsonString(out, value);
+            try out.writeAll(",\"remaining_percent\":null,\"total\":null,\"used\":null,\"reset_at\":null}");
+            return;
+        }
     }
     if (window == null) {
         try writeJsonString(out, "unknown");
@@ -314,7 +317,8 @@ fn apiModeUsesApi(default_enabled: bool, mode: cli.types.ApiMode) bool {
     };
 }
 
-test "writeUsageWindowJson uses override status instead of stale usage" {
+// 验证确定性错误会覆盖历史用量，防止继续展示已失效账号的旧数据。
+test "writeUsageWindowJson uses non-timeout override instead of stale usage" {
     var buffer: [256]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
 
@@ -331,6 +335,41 @@ test "writeUsageWindowJson uses override status instead of stale usage" {
 
     try std.testing.expectEqualStrings(
         "{\"status\":\"401 token_invalidated\",\"remaining_percent\":null,\"total\":null,\"used\":null,\"reset_at\":null}",
+        writer.buffered(),
+    );
+}
+
+// 验证临时超时时继续输出上一次成功用量和原重置时间。
+test "writeUsageWindowJson keeps stale usage on timeout" {
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+
+    try writeUsageWindowJson(
+        &writer,
+        .{
+            .used_percent = 34,
+            .window_minutes = 300,
+            .resets_at = 4_102_444_800,
+        },
+        1_800_000_000,
+        "TimedOut",
+    );
+
+    try std.testing.expectEqualStrings(
+        "{\"status\":\"ok\",\"remaining_percent\":66,\"total\":100,\"used\":34,\"reset_at\":4102444800}",
+        writer.buffered(),
+    );
+}
+
+// 验证从未成功获取用量时不会把超时伪装成有效数据。
+test "writeUsageWindowJson exposes timeout without stale usage" {
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+
+    try writeUsageWindowJson(&writer, null, 1_800_000_000, "TimedOut");
+
+    try std.testing.expectEqualStrings(
+        "{\"status\":\"TimedOut\",\"remaining_percent\":null,\"total\":null,\"used\":null,\"reset_at\":null}",
         writer.buffered(),
     );
 }
