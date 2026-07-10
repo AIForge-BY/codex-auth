@@ -17,6 +17,9 @@ struct MenuBarView: View {
             if isAddingAccount {
                 addAccountPanel
             }
+            if appState.pendingDeleteAccount != nil {
+                deleteConfirmationPanel
+            }
             if let error = appState.errorMessage {
                 Text(error)
                     .font(.footnote)
@@ -32,23 +35,6 @@ struct MenuBarView: View {
                 }
             }
             .frame(width: 0, height: 0)
-        }
-        .confirmationDialog(
-            "确定删除此账号？",
-            isPresented: Binding(
-                get: { appState.isShowingDeleteConfirmation },
-                set: { if !$0 { appState.cancelDelete() } }
-            ),
-            titleVisibility: .visible
-        ) {
-            Button("删除", role: .destructive) {
-                Task { await appState.confirmDelete() }
-            }
-            Button("取消", role: .cancel) {
-                appState.cancelDelete()
-            }
-        } message: {
-            Text("删除后会移除此账号的本地快照。")
         }
     }
 
@@ -160,6 +146,37 @@ struct MenuBarView: View {
                 isAddingAccount = false
             }
         }
+    }
+
+    /// 在菜单窗口内确认删除，避免 macOS 菜单栏浮窗中的系统确认弹窗阻塞交互。
+    private var deleteConfirmationPanel: some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("确定删除此账号？")
+                    .font(.footnote)
+                    .fontWeight(.semibold)
+                Text(appState.pendingDeleteAccount?.primaryLabel ?? "")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            Button("取消") {
+                appState.cancelDelete()
+            }
+            .disabled(appState.isLoading)
+
+            Button("删除", role: .destructive) {
+                Task { await appState.confirmDelete() }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(appState.isLoading)
+        }
+        .padding(10)
+        .background(Color.secondary.opacity(0.10))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     @MainActor
