@@ -182,7 +182,7 @@ fn writeAccountJson(
     try out.print(",\"is_active\":{},", .{is_active});
     try out.writeAll("\"usage\":{");
     try out.writeAll("\"five_hour\":");
-    try writeUsageWindowJson(out, registry.resolveRateWindow(rec.last_usage, 300, true), now, usage_override);
+    try writeOptionalUsageWindowJson(out, registry.resolveRateWindow(rec.last_usage, 300, true), now, usage_override);
     try out.writeAll(",\"seven_day\":");
     try writeUsageWindowJson(out, registry.resolveRateWindow(rec.last_usage, 10080, false), now, usage_override);
     try out.writeAll("},\"last_usage_at\":");
@@ -190,6 +190,20 @@ fn writeAccountJson(
     try out.writeAll(",\"last_refresh_at\":");
     try writeOptionalInt(out, rec.last_usage_at);
     try out.writeAll("}");
+}
+
+// 输出可选用量窗口；接口没有明确返回该窗口时使用 null，避免展示猜测数据。
+fn writeOptionalUsageWindowJson(
+    out: *std.Io.Writer,
+    window: ?registry.RateLimitWindow,
+    now: i64,
+    usage_override: ?[]const u8,
+) !void {
+    if (window == null) {
+        try out.writeAll("null");
+        return;
+    }
+    try writeUsageWindowJson(out, window, now, usage_override);
 }
 
 // 输出单个用量窗口；临时超时保留历史值，其他刷新失败用 status 承载可见错误。
@@ -372,4 +386,14 @@ test "writeUsageWindowJson exposes timeout without stale usage" {
         "{\"status\":\"TimedOut\",\"remaining_percent\":null,\"total\":null,\"used\":null,\"reset_at\":null}",
         writer.buffered(),
     );
+}
+
+// 验证接口未返回 300 分钟窗口时 GUI 使用 null，并忽略账号级错误覆盖。
+test "writeOptionalUsageWindowJson omits missing window" {
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+
+    try writeOptionalUsageWindowJson(&writer, null, 1_800_000_000, "401 token_invalidated");
+
+    try std.testing.expectEqualStrings("null", writer.buffered());
 }

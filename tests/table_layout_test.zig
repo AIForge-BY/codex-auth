@@ -94,6 +94,34 @@ test "Scenario: Given a narrow table when rendering then account identity and us
     try std.testing.expect(std.mem.indexOf(u8, output, "Now") == null);
 }
 
+test "Scenario: Given no five hour window when rendering then zero-width column and separator are omitted" {
+    var rows = [_]SwitchRow{
+        testRow("work-main", "Plus", "100%", "93%", "Now"),
+    };
+    var reg = makeTestRegistry();
+    defer reg.deinit(std.testing.allocator);
+
+    var buffer: [1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try renderListScreenViewport(&writer, &reg, &rows, 2, .{
+        .email = 9,
+        .plan = 4,
+        .rate_5h = 0,
+        .rate_week = 6,
+        .last = 4,
+    }, false, "", .{
+        .start_row = 0,
+        .max_rows = 1,
+        .max_cols = 80,
+    });
+
+    const output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "5H") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "100%") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "PLAN  WEEKLY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "93%") != null);
+}
+
 test "Scenario: Given remaining table width when rendering then status plan and last expand before account becomes complete" {
     var rows = [_]SwitchRow{
         testRow("very-long-account-name@example.com", "Business", "100%", "42%", "Now"),

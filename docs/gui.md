@@ -47,7 +47,7 @@ Account fields:
 - `plan`
 - `auth_mode`
 - `is_active`
-- `usage.five_hour`
+- `usage.five_hour`: usage window object or `null` when the API does not explicitly report a 300-minute window.
 - `usage.seven_day`
 - `last_usage_at`
 - `last_refresh_at`

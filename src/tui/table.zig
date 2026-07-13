@@ -7,7 +7,7 @@ const io_util = @import("../core/io_util.zig");
 const rate_limit = @import("rate_limit.zig");
 const timefmt = @import("../time/relative.zig");
 
-const resolveRateWindow = rate_limit.resolveRateWindow;
+const resolveRateWindow = registry.resolveRateWindow;
 const formatRateLimitUiAlloc = rate_limit.formatRateLimitUiAlloc;
 pub const formatRateLimitFullAlloc = rate_limit.formatRateLimitFullAlloc;
 
@@ -76,6 +76,14 @@ fn usageCellFullTextAlloc(
     return formatRateLimitFullAlloc(window);
 }
 
+// 判断当前账号集合是否明确包含指定分钟数的用量窗口。
+fn registryHasRateWindow(reg: *const registry.Registry, minutes: i64) bool {
+    for (reg.accounts.items) |rec| {
+        if (resolveRateWindow(rec.last_usage, minutes, true) != null) return true;
+    }
+    return false;
+}
+
 pub fn writeAccountsTableWithUsageOverrides(
     out: *std.Io.Writer,
     reg: *registry.Registry,
@@ -83,10 +91,11 @@ pub fn writeAccountsTableWithUsageOverrides(
     usage_overrides: ?[]const ?[]const u8,
 ) !void {
     const headers = [_][]const u8{ "ACCOUNT", "PLAN", "5H", "WEEKLY", "LAST ACTIVITY" };
+    const show_five_hour = registryHasRateWindow(reg, 300);
     var widths = [_]usize{
         headers[0].len,
         headers[1].len,
-        headers[2].len,
+        if (show_five_hour) headers[2].len else 0,
         headers[3].len,
         headers[4].len,
     };
@@ -114,7 +123,7 @@ pub fn writeAccountsTableWithUsageOverrides(
             defer std.heap.page_allocator.free(last_str);
 
             widths[1] = @max(widths[1], plan.len);
-            widths[2] = @max(widths[2], rate_5h_str.len);
+            if (show_five_hour) widths[2] = @max(widths[2], rate_5h_str.len);
             widths[3] = @max(widths[3], rate_week_str.len);
             widths[4] = @max(widths[4], last_str.len);
         }
@@ -140,8 +149,10 @@ pub fn writeAccountsTableWithUsageOverrides(
     try writePadded(out, h0, widths[0]);
     try out.writeAll("  ");
     try writePadded(out, h1, widths[1]);
-    try out.writeAll("  ");
-    try writePadded(out, h2, widths[2]);
+    if (show_five_hour) {
+        try out.writeAll("  ");
+        try writePadded(out, h2, widths[2]);
+    }
     try out.writeAll("  ");
     try writePadded(out, h3, widths[3]);
     try out.writeAll("  ");
@@ -193,8 +204,10 @@ pub fn writeAccountsTableWithUsageOverrides(
             try writePadded(out, account_cell, widths[0] - indent_to_print);
             try out.writeAll("  ");
             try writePadded(out, plan_cell, widths[1]);
-            try out.writeAll("  ");
-            try writePadded(out, rate_5h_cell, widths[2]);
+            if (show_five_hour) {
+                try out.writeAll("  ");
+                try writePadded(out, rate_5h_cell, widths[2]);
+            }
             try out.writeAll("  ");
             try writePadded(out, rate_week_cell, widths[3]);
             try out.writeAll("  ");
@@ -284,8 +297,13 @@ fn writeRepeat(out: *std.Io.Writer, ch: u8, count: usize) !void {
 
 fn listTotalWidth(widths: *const [5]usize, prefix_len: usize, sep_len: usize) usize {
     var sum: usize = prefix_len;
-    for (widths) |w| sum += w;
-    sum += sep_len * (widths.len - 1);
+    var visible_columns: usize = 0;
+    for (widths) |w| {
+        if (w == 0) continue;
+        sum += w;
+        visible_columns += 1;
+    }
+    if (visible_columns > 1) sum += sep_len * (visible_columns - 1);
     return sum;
 }
 

@@ -60,7 +60,9 @@ struct AccountRow: View {
 
     private var usageLine: some View {
         VStack(alignment: .leading, spacing: 2) {
-            usageText(prefix: "5小时", window: account.usage.fiveHour)
+            if let fiveHour = account.usage.fiveHour {
+                usageText(prefix: "5小时", window: fiveHour)
+            }
             usageText(prefix: "7天", window: account.usage.sevenDay)
         }
         .font(.caption)

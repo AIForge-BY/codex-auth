@@ -84,6 +84,14 @@ fn usageCellTextAlloc(
     return formatRateLimitSwitchAlloc(allocator, window);
 }
 
+// 判断注册表中是否有账号明确返回指定分钟数的用量窗口。
+fn registryHasRateWindow(reg: *const registry.Registry, minutes: i64) bool {
+    for (reg.accounts.items) |rec| {
+        if (registry.resolveRateWindow(rec.last_usage, minutes, true) != null) return true;
+    }
+    return false;
+}
+
 pub fn buildSwitchRows(allocator: std.mem.Allocator, reg: *registry.Registry) !SwitchRows {
     return buildSwitchRowsWithUsageOverrides(allocator, reg, null);
 }
@@ -96,10 +104,11 @@ pub fn buildSwitchRowsWithUsageOverrides(
     var display = try display_rows.buildDisplayRows(allocator, reg, null);
     defer display.deinit(allocator);
     var rows = try allocator.alloc(SwitchRow, display.rows.len);
+    const show_five_hour = registryHasRateWindow(reg, 300);
     var widths = SwitchWidths{
         .email = "EMAIL".len,
         .plan = "PLAN".len,
-        .rate_5h = "5H".len,
+        .rate_5h = if (show_five_hour) "5H".len else 0,
         .rate_week = "WEEKLY".len,
         .last = "LAST".len,
     };
@@ -111,7 +120,10 @@ pub fn buildSwitchRowsWithUsageOverrides(
             const rate_5h = resolveRateWindow(rec.last_usage, 300, true);
             const rate_week = resolveRateWindow(rec.last_usage, 10080, false);
             const usage_override = usageOverrideForAccount(usage_overrides, account_idx);
-            const rate_5h_str = try usageCellTextAlloc(allocator, rate_5h, usage_override);
+            const rate_5h_str = if (show_five_hour)
+                try usageCellTextAlloc(allocator, rate_5h, usage_override)
+            else
+                try allocator.dupe(u8, "");
             const rate_week_str = try usageCellTextAlloc(allocator, rate_week, usage_override);
             const last = try timefmt.formatRelativeTimeOrDashAlloc(allocator, rec.last_usage_at, now);
             rows[i] = .{
@@ -128,7 +140,7 @@ pub fn buildSwitchRowsWithUsageOverrides(
             };
             widths.email = @max(widths.email, display_row.account_cell.len + (@as(usize, display_row.depth) * 2));
             widths.plan = @max(widths.plan, plan.len);
-            widths.rate_5h = @max(widths.rate_5h, rate_5h_str.len);
+            if (show_five_hour) widths.rate_5h = @max(widths.rate_5h, rate_5h_str.len);
             widths.rate_week = @max(widths.rate_week, rate_week_str.len);
             widths.last = @max(widths.last, last.len);
         } else {
@@ -172,10 +184,11 @@ pub fn buildSwitchRowsFromIndicesWithUsageOverrides(
     var display = try display_rows.buildDisplayRows(allocator, reg, indices);
     defer display.deinit(allocator);
     var rows = try allocator.alloc(SwitchRow, display.rows.len);
+    const show_five_hour = registryHasRateWindow(reg, 300);
     var widths = SwitchWidths{
         .email = "EMAIL".len,
         .plan = "PLAN".len,
-        .rate_5h = "5H".len,
+        .rate_5h = if (show_five_hour) "5H".len else 0,
         .rate_week = "WEEKLY".len,
         .last = "LAST".len,
     };
@@ -187,7 +200,10 @@ pub fn buildSwitchRowsFromIndicesWithUsageOverrides(
             const rate_5h = resolveRateWindow(rec.last_usage, 300, true);
             const rate_week = resolveRateWindow(rec.last_usage, 10080, false);
             const usage_override = usageOverrideForAccount(usage_overrides, account_idx);
-            const rate_5h_str = try usageCellTextAlloc(allocator, rate_5h, usage_override);
+            const rate_5h_str = if (show_five_hour)
+                try usageCellTextAlloc(allocator, rate_5h, usage_override)
+            else
+                try allocator.dupe(u8, "");
             const rate_week_str = try usageCellTextAlloc(allocator, rate_week, usage_override);
             const last = try timefmt.formatRelativeTimeOrDashAlloc(allocator, rec.last_usage_at, now);
             rows[i] = .{
@@ -204,7 +220,7 @@ pub fn buildSwitchRowsFromIndicesWithUsageOverrides(
             };
             widths.email = @max(widths.email, display_row.account_cell.len + (@as(usize, display_row.depth) * 2));
             widths.plan = @max(widths.plan, plan.len);
-            widths.rate_5h = @max(widths.rate_5h, rate_5h_str.len);
+            if (show_five_hour) widths.rate_5h = @max(widths.rate_5h, rate_5h_str.len);
             widths.rate_week = @max(widths.rate_week, rate_week_str.len);
             widths.last = @max(widths.last, last.len);
         } else {
@@ -231,21 +247,8 @@ pub fn buildSwitchRowsFromIndicesWithUsageOverrides(
     };
 }
 
-pub fn resolveRateWindow(usage: ?registry.RateLimitSnapshot, minutes: i64, fallback_primary: bool) ?registry.RateLimitWindow {
-    if (usage == null) return null;
-    var has_explicit_window_minutes = false;
-    if (usage.?.primary) |p| {
-        has_explicit_window_minutes = has_explicit_window_minutes or p.window_minutes != null;
-        if (p.window_minutes != null and p.window_minutes.? == minutes) return p;
-    }
-    if (usage.?.secondary) |s| {
-        has_explicit_window_minutes = has_explicit_window_minutes or s.window_minutes != null;
-        if (s.window_minutes != null and s.window_minutes.? == minutes) return s;
-    }
-    // 仅在旧快照完全没有窗口长度时按位置兜底，避免把非 7 天窗口误显示为 7 天。
-    if (has_explicit_window_minutes) return null;
-    return if (fallback_primary) usage.?.primary else usage.?.secondary;
-}
+// 复用注册表的显式窗口解析规则，供选择器自动切号逻辑调用。
+pub const resolveRateWindow = registry.resolveRateWindow;
 
 fn formatRateLimitSwitchAlloc(allocator: std.mem.Allocator, window: ?registry.RateLimitWindow) ![]u8 {
     if (window == null) return try std.fmt.allocPrint(allocator, "-", .{});

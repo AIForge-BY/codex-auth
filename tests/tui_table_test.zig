@@ -126,7 +126,7 @@ test "writeAccountsTable shows zero-padded row numbers for selectable accounts" 
     try std.testing.expect(std.mem.indexOf(u8, output, "02   Free") != null);
 }
 
-test "writeAccountsTable keeps usage headers short" {
+test "writeAccountsTable hides five hour column without explicit window" {
     const gpa = std.testing.allocator;
     var reg = makeTestRegistry();
     defer reg.deinit(gpa);
@@ -138,9 +138,31 @@ test "writeAccountsTable keeps usage headers short" {
     try writeAccountsTable(&writer, &reg, false);
 
     const output = writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, output, "5H") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "5H") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "WEEKLY") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "USAGE") == null);
+}
+
+test "writeAccountsTable shows five hour column for explicit window" {
+    const gpa = std.testing.allocator;
+    var reg = makeTestRegistry();
+    defer reg.deinit(gpa);
+
+    try appendTestAccount(gpa, &reg, "user-1::acc-1", "user@example.com", "", .team);
+    reg.accounts.items[0].last_usage = .{
+        .primary = .{ .used_percent = 10, .window_minutes = 300, .resets_at = 4_102_444_800 },
+        .secondary = .{ .used_percent = 20, .window_minutes = 10080, .resets_at = 4_103_049_600 },
+        .credits = null,
+        .plan_type = .team,
+    };
+
+    var buffer: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeAccountsTable(&writer, &reg, false);
+
+    const output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "5H") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "WEEKLY") != null);
 }
 
 test "writeAccountsTable shows usage override statuses for failed refreshes" {
@@ -158,7 +180,7 @@ test "writeAccountsTable shows usage override statuses for failed refreshes" {
     try writeAccountsTableWithUsageOverrides(&writer, &reg, false, &usage_overrides);
 
     const output = writer.buffered();
-    try std.testing.expect(std.mem.count(u8, output, "403") >= 2);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "403"));
 }
 
 test "writeAccountsTable highlights usage override rows in red when color is enabled" {

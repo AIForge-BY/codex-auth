@@ -430,20 +430,17 @@ pub fn remainingPercentAt(window: ?RateLimitWindow, now: i64) ?i64 {
     return @as(i64, @intFromFloat(remaining));
 }
 
+// 按接口明确返回的窗口分钟数解析用量，不再依据 primary/secondary 位置猜测窗口类型。
 pub fn resolveRateWindow(usage: ?RateLimitSnapshot, minutes: i64, fallback_primary: bool) ?RateLimitWindow {
+    _ = fallback_primary;
     if (usage == null) return null;
-    var has_explicit_window_minutes = false;
     if (usage.?.primary) |p| {
-        has_explicit_window_minutes = has_explicit_window_minutes or p.window_minutes != null;
         if (p.window_minutes != null and p.window_minutes.? == minutes) return p;
     }
     if (usage.?.secondary) |s| {
-        has_explicit_window_minutes = has_explicit_window_minutes or s.window_minutes != null;
         if (s.window_minutes != null and s.window_minutes.? == minutes) return s;
     }
-    // 仅在旧快照完全没有窗口长度时按位置兜底，避免把非 7 天窗口误显示为 7 天。
-    if (has_explicit_window_minutes) return null;
-    return if (fallback_primary) usage.?.primary else usage.?.secondary;
+    return null;
 }
 
 pub fn hasStoredAccountName(rec: *const AccountRecord) bool {

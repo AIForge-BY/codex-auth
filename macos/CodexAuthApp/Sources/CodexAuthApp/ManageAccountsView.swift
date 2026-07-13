@@ -94,9 +94,11 @@ private struct AccountDetailView: View {
                     Text("认证")
                     Text(account.authMode ?? "未知")
                 }
-                GridRow {
-                    Text("5小时额度")
-                    Text(account.fiveHourUsageText)
+                if let fiveHourUsageText = account.fiveHourUsageText {
+                    GridRow {
+                        Text("5小时额度")
+                        Text(fiveHourUsageText)
+                    }
                 }
                 GridRow {
                     Text("7天额度")

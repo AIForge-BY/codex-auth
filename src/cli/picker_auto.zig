@@ -30,18 +30,21 @@ fn resetDistanceSeconds(window: ?registry.RateLimitWindow, now: i64) i64 {
     return @max(resets_at - now, 0);
 }
 
-fn resetDistanceForMinutes(usage: ?registry.RateLimitSnapshot, minutes: i64, fallback_primary: bool, now: i64) i64 {
-    return resetDistanceSeconds(resolveRateWindow(usage, minutes, fallback_primary), now);
-}
-
 fn autoSwitchCandidateIsBetter(candidate: *const registry.AccountRecord, best: *const registry.AccountRecord, now: i64) bool {
-    const candidate_5h_reset = resetDistanceForMinutes(candidate.last_usage, 300, true, now);
-    const best_5h_reset = resetDistanceForMinutes(best.last_usage, 300, true, now);
-    if (candidate_5h_reset != best_5h_reset) return candidate_5h_reset < best_5h_reset;
+    const candidate_5h = resolveRateWindow(candidate.last_usage, 300, true);
+    const best_5h = resolveRateWindow(best.last_usage, 300, true);
+    if (candidate_5h != null and best_5h != null) {
+        const candidate_5h_reset = resetDistanceSeconds(candidate_5h, now);
+        const best_5h_reset = resetDistanceSeconds(best_5h, now);
+        if (candidate_5h_reset != best_5h_reset) return candidate_5h_reset < best_5h_reset;
+    }
 
-    const candidate_weekly_reset = resetDistanceForMinutes(candidate.last_usage, 10080, false, now);
-    const best_weekly_reset = resetDistanceForMinutes(best.last_usage, 10080, false, now);
-    return candidate_weekly_reset < best_weekly_reset;
+    const candidate_weekly = resolveRateWindow(candidate.last_usage, 10080, false);
+    const best_weekly = resolveRateWindow(best.last_usage, 10080, false);
+    if (candidate_weekly != null and best_weekly != null) {
+        return resetDistanceSeconds(candidate_weekly, now) < resetDistanceSeconds(best_weekly, now);
+    }
+    return false;
 }
 
 fn bestAutoSwitchCandidateSelectableIndex(

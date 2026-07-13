@@ -949,7 +949,7 @@ test "Scenario: Given grouped accounts when rendering switch list then child row
     try std.testing.expect(std.mem.indexOf(u8, output, "02   Free") != null);
 }
 
-test "Scenario: Given usage overrides when rendering switch list then failed rows show response status in both usage columns" {
+test "Scenario: Given usage overrides when rendering switch list then failed rows show response status in available usage columns" {
     const gpa = std.testing.allocator;
     var reg = makeTestRegistry();
     defer reg.deinit(gpa);
@@ -967,7 +967,8 @@ test "Scenario: Given usage overrides when rendering switch list then failed row
     try renderSwitchList(&writer, &reg, rows.items, idx_width, rows.widths, null, false);
 
     const output = writer.buffered();
-    try std.testing.expect(std.mem.count(u8, output, "401") >= 2);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "401"));
+    try std.testing.expectEqual(@as(usize, 0), rows.widths.rate_5h);
 }
 
 test "Scenario: Given usage overrides when selecting switch accounts then errored rows are skipped" {
@@ -1503,7 +1504,7 @@ test "Scenario: Given a live TUI write failure when mapping output errors then i
     try std.testing.expect(mapTuiOutputError(error.EndOfStream) == error.EndOfStream);
 }
 
-test "Scenario: Given usage overrides when rendering remove list then failed rows show response status in both usage columns" {
+test "Scenario: Given usage overrides when rendering remove list then failed rows show response status in available usage columns" {
     const gpa = std.testing.allocator;
     var reg = makeTestRegistry();
     defer reg.deinit(gpa);
@@ -1522,7 +1523,7 @@ test "Scenario: Given usage overrides when rendering remove list then failed row
     try renderRemoveList(&writer, &reg, rows.items, idx_width, rows.widths, null, &checked, false);
 
     const output = writer.buffered();
-    try std.testing.expect(std.mem.count(u8, output, "401") >= 2);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "401"));
 }
 
 test "Scenario: Given usage overrides when rendering switch list with color then failed rows are highlighted red" {

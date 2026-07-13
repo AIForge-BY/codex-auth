@@ -119,16 +119,21 @@ struct CodexAccount: Decodable, Identifiable, Equatable {
         }
     }
 
-    var fiveHourUsageText: String {
-        usage.fiveHour.displayTextWithReset
+    /// 返回可选的 5 小时用量文案；接口未提供该窗口时不生成占位内容。
+    var fiveHourUsageText: String? {
+        usage.fiveHour?.displayTextWithReset
     }
 
     var sevenDayUsageText: String {
         usage.sevenDay.displayTextWithReset
     }
 
-    var menuBarFiveHourText: String {
-        "5h \(usage.fiveHour.menuBarPercentText)"
+    /// 返回菜单栏 5 小时片段；窗口不存在时由展示层直接省略。
+    var menuBarFiveHourText: String? {
+        guard let fiveHour = usage.fiveHour else {
+            return nil
+        }
+        return "5h \(fiveHour.menuBarPercentText)"
     }
 
     var menuBarSevenDayText: String {
@@ -156,7 +161,7 @@ struct CodexAccount: Decodable, Identifiable, Equatable {
 }
 
 struct UsageInfo: Decodable, Equatable {
-    let fiveHour: UsageWindow
+    let fiveHour: UsageWindow?
     let sevenDay: UsageWindow
 }
 

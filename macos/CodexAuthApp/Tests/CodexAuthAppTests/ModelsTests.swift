@@ -142,6 +142,27 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(window.menuBarUsageTone, .unavailable)
     }
 
+    /// 验证仅返回周窗口时可正常解码，并保留窗口缺失语义。
+    func testDecodesUsageWithoutFiveHourWindow() throws {
+        let json = """
+        {
+          "five_hour": null,
+          "seven_day": {
+            "status": "ok",
+            "remaining_percent": 93,
+            "total": 100,
+            "used": 7,
+            "reset_at": null
+          }
+        }
+        """.data(using: .utf8)!
+
+        let usage = try JSONDecoder.codexAuth.decode(UsageInfo.self, from: json)
+
+        XCTAssertNil(usage.fiveHour)
+        XCTAssertEqual(usage.sevenDay.remainingPercent, 93)
+    }
+
     func testMenuBarQuotaToneMatchesExistingUsageThreshold() {
         let low = UsageWindow(status: "ok", remainingPercent: 19, total: 100, used: 81, resetAt: nil)
         let available = UsageWindow(status: "ok", remainingPercent: 20, total: 100, used: 80, resetAt: nil)
@@ -172,6 +193,32 @@ final class ModelsTests: XCTestCase {
 
         XCTAssertEqual(presentation.plainText, "5h 99%\n7d 12%")
         XCTAssertEqual(presentation.segments.map(\.tone), [.available, .low])
+        XCTAssertLessThan(presentation.minimumStatusItemLength, 78)
+    }
+
+    /// 验证缺少 5 小时窗口时菜单栏只保留周用量片段。
+    func testStatusItemPresentationOmitsMissingFiveHourSegment() {
+        let account = CodexAccount(
+            accountKey: "acct-123456",
+            displayName: "me@example.com",
+            alias: "工作号",
+            email: "me@example.com",
+            accountName: nil,
+            plan: "plus",
+            authMode: "chatgpt",
+            isActive: true,
+            usage: UsageInfo(
+                fiveHour: nil,
+                sevenDay: UsageWindow(status: "ok", remainingPercent: 93, total: 100, used: 7, resetAt: nil)
+            ),
+            lastUsageAt: nil,
+            lastRefreshAt: nil
+        )
+
+        let presentation = StatusItemPresentation(account: account, isLoading: false)
+
+        XCTAssertEqual(presentation.plainText, "7d 93%")
+        XCTAssertEqual(presentation.segments.map(\.tone), [.available])
         XCTAssertLessThan(presentation.minimumStatusItemLength, 78)
     }
 }

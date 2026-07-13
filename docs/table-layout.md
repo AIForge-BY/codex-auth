@@ -15,13 +15,17 @@ typically the live case.
 The account table uses two account-width phases:
 
 1. Give `ACCOUNT` enough width to remain identifiable.
-2. Give live status columns room in priority order: `5H`, `WEEKLY`, `PLAN`,
-   then `LAST`.
-3. Expand `5H`, `WEEKLY`, `PLAN`, and `LAST` to their requested widths.
+2. Give live status columns room in priority order: optional `5H`, `WEEKLY`,
+   `PLAN`, then `LAST`.
+3. Expand the available usage columns, `PLAN`, and `LAST` to their requested widths.
 4. Use any remaining width to expand `ACCOUNT` toward its requested width.
 
 This means `ACCOUNT` is always considered first, but a long account label should
-not consume the whole table before `5H` and `WEEKLY` are visible.
+not consume the whole table before the available usage columns are visible.
+
+`5H` is present only when at least one rendered account explicitly reports a
+300-minute usage window. A missing optional column has zero width and does not
+consume separator space.
 
 ## Account Truncation
 
@@ -50,8 +54,10 @@ label is truncated.
 
 ## Narrow Width Examples
 
-The visible column order remains `ACCOUNT`, `PLAN`, `5H`, `WEEKLY`, `LAST`, but
-width is assigned by usefulness rather than visual order.
+When all windows are available, the visible column order remains `ACCOUNT`,
+`PLAN`, `5H`, `WEEKLY`, `LAST`, but width is assigned by usefulness rather than
+visual order. Without a 300-minute window, `5H` is omitted while the relative
+order of the remaining columns stays unchanged.
 
 Wide enough:
 

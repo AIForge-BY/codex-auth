@@ -432,7 +432,7 @@ test "resolveRateWindow rejects explicit mismatched secondary window" {
     try std.testing.expectEqual(@as(f64, 1), registry.resolveRateWindow(usage, 300, true).?.used_percent);
 }
 
-test "resolveRateWindow keeps positional fallback for legacy snapshots" {
+test "resolveRateWindow rejects legacy snapshots without explicit window minutes" {
     const usage: registry.RateLimitSnapshot = .{
         .primary = .{
             .used_percent = 4,
@@ -448,8 +448,8 @@ test "resolveRateWindow keeps positional fallback for legacy snapshots" {
         .plan_type = .plus,
     };
 
-    try std.testing.expectEqual(@as(f64, 4), registry.resolveRateWindow(usage, 300, true).?.used_percent);
-    try std.testing.expectEqual(@as(f64, 8), registry.resolveRateWindow(usage, 10080, false).?.used_percent);
+    try std.testing.expect(registry.resolveRateWindow(usage, 300, true) == null);
+    try std.testing.expect(registry.resolveRateWindow(usage, 10080, false) == null);
 }
 
 test "registry load defaults missing account_name field to null" {

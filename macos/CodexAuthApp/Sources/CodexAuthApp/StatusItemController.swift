@@ -11,18 +11,20 @@ struct StatusItemPresentation: Equatable {
     let segments: [StatusItemSegment]
     let isLoading: Bool
 
+    /// 根据账号实际返回的窗口生成菜单栏片段，缺失的 5 小时窗口不会占位。
     init(account: CodexAccount?, isLoading: Bool) {
         self.isLoading = isLoading
-        self.segments = [
-            StatusItemSegment(
-                text: account?.menuBarFiveHourText ?? "5h --",
-                tone: account?.usage.fiveHour.menuBarUsageTone ?? .unavailable
-            ),
+        var segments: [StatusItemSegment] = []
+        if let account, let fiveHour = account.usage.fiveHour, let text = account.menuBarFiveHourText {
+            segments.append(StatusItemSegment(text: text, tone: fiveHour.menuBarUsageTone))
+        }
+        segments.append(
             StatusItemSegment(
                 text: account?.menuBarSevenDayText ?? "7d --",
                 tone: account?.usage.sevenDay.menuBarUsageTone ?? .unavailable
-            ),
-        ]
+            )
+        )
+        self.segments = segments
     }
 
     var plainText: String {

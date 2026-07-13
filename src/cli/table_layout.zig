@@ -74,8 +74,10 @@ pub const LiveTable = struct {
         out: *std.Io.Writer,
         cells: *const [column_count]Cell,
     ) !void {
+        var wrote_cell = false;
         for (self.columns, 0..) |column, i| {
-            if (i > 0) try out.writeAll("  ");
+            if (column.width == 0) continue;
+            if (wrote_cell) try out.writeAll("  ");
             const indent = @min(cells[i].indent, column.width);
             try writeRepeat(out, ' ', indent);
             if (i == 0) {
@@ -83,6 +85,7 @@ pub const LiveTable = struct {
             } else {
                 try writeTruncatedPadded(out, cells[i].text, column.width - indent);
             }
+            wrote_cell = true;
         }
     }
 };
@@ -102,7 +105,7 @@ pub fn accountTable(widths: SwitchWidths, prefix_width: usize) LiveTable {
 
 pub fn boundWidths(widths: SwitchWidths, prefix_width: usize, max_cols: ?usize) SwitchWidths {
     const cols = max_cols orelse return widths;
-    const separator_width = 2 * (column_count - 1);
+    const separator_width = 2 * (visibleColumnCount(widths) - 1);
     if (cols <= prefix_width + separator_width) {
         return .{
             .email = 0,
@@ -135,6 +138,17 @@ pub fn boundWidths(widths: SwitchWidths, prefix_width: usize, max_cols: ?usize) 
     growBoundedWidth(&remaining, &bounded.email, widths.email);
 
     return bounded;
+}
+
+// 计算实际显示的列数，零宽列不会占用分隔符空间。
+fn visibleColumnCount(widths: SwitchWidths) usize {
+    var count: usize = 0;
+    if (widths.email > 0) count += 1;
+    if (widths.plan > 0) count += 1;
+    if (widths.rate_5h > 0) count += 1;
+    if (widths.rate_week > 0) count += 1;
+    if (widths.last > 0) count += 1;
+    return count;
 }
 
 fn growBoundedWidth(remaining: *usize, current: *usize, target: usize) void {
