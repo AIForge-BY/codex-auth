@@ -217,8 +217,44 @@ final class ModelsTests: XCTestCase {
 
         let presentation = StatusItemPresentation(account: account, isLoading: false)
 
-        XCTAssertEqual(presentation.plainText, "7d 93%")
+        XCTAssertEqual(presentation.plainText, "93%")
         XCTAssertEqual(presentation.segments.map(\.tone), [.available])
-        XCTAssertLessThan(presentation.minimumStatusItemLength, 78)
+        XCTAssertLessThan(presentation.minimumStatusItemLength, 45)
+    }
+
+    /// 验证单行额度在菜单栏高度内垂直居中，避免文字在移除 5 小时窗口后上移。
+    func testStatusItemPresentationCentersSingleLine() {
+        let presentation = StatusItemPresentation(account: nil, isLoading: false)
+
+        XCTAssertEqual(
+            presentation.lineOrigins(containerHeight: 24, textHeight: 11, lineSpacing: 10),
+            [6]
+        )
+    }
+
+    /// 验证双行额度作为整体居中，并保持从上到下的固定行距。
+    func testStatusItemPresentationCentersTwoLines() {
+        let account = CodexAccount(
+            accountKey: "acct-123456",
+            displayName: "me@example.com",
+            alias: "工作号",
+            email: "me@example.com",
+            accountName: nil,
+            plan: "plus",
+            authMode: "chatgpt",
+            isActive: true,
+            usage: UsageInfo(
+                fiveHour: UsageWindow(status: "ok", remainingPercent: 90, total: 100, used: 10, resetAt: nil),
+                sevenDay: UsageWindow(status: "ok", remainingPercent: 80, total: 100, used: 20, resetAt: nil)
+            ),
+            lastUsageAt: nil,
+            lastRefreshAt: nil
+        )
+        let presentation = StatusItemPresentation(account: account, isLoading: false)
+
+        XCTAssertEqual(
+            presentation.lineOrigins(containerHeight: 24, textHeight: 11, lineSpacing: 10),
+            [11, 1]
+        )
     }
 }

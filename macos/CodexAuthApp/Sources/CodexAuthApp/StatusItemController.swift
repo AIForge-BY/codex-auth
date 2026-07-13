@@ -17,13 +17,20 @@ struct StatusItemPresentation: Equatable {
         var segments: [StatusItemSegment] = []
         if let account, let fiveHour = account.usage.fiveHour, let text = account.menuBarFiveHourText {
             segments.append(StatusItemSegment(text: text, tone: fiveHour.menuBarUsageTone))
-        }
-        segments.append(
-            StatusItemSegment(
-                text: account?.menuBarSevenDayText ?? "7d --",
-                tone: account?.usage.sevenDay.menuBarUsageTone ?? .unavailable
+            segments.append(
+                StatusItemSegment(
+                    text: account.menuBarSevenDayText,
+                    tone: account.usage.sevenDay.menuBarUsageTone
+                )
             )
-        )
+        } else {
+            segments.append(
+                StatusItemSegment(
+                    text: account?.usage.sevenDay.menuBarPercentText ?? "--",
+                    tone: account?.usage.sevenDay.menuBarUsageTone ?? .unavailable
+                )
+            )
+        }
         self.segments = segments
     }
 
@@ -36,8 +43,20 @@ struct StatusItemPresentation: Equatable {
         let textWidth = segments
             .map { ($0.text as NSString).size(withAttributes: [.font: font]).width }
             .max() ?? 0
-        let imageAndPaddingWidth: CGFloat = 32
-        return ceil(textWidth + imageAndPaddingWidth)
+        let horizontalPaddingWidth: CGFloat = 8
+        return ceil(textWidth + horizontalPaddingWidth)
+    }
+
+    /// 按实际片段数量计算从上到下的绘制原点，使单行和双行内容都整体垂直居中。
+    func lineOrigins(containerHeight: CGFloat, textHeight: CGFloat, lineSpacing: CGFloat) -> [CGFloat] {
+        guard !segments.isEmpty else {
+            return []
+        }
+        let contentHeight = textHeight + CGFloat(segments.count - 1) * lineSpacing
+        let bottomY = floor((containerHeight - contentHeight) / 2)
+        return segments.indices.map { index in
+            bottomY + CGFloat(segments.count - index - 1) * lineSpacing
+        }
     }
 }
 
@@ -209,29 +228,23 @@ private final class QuotaStatusItemView: NSView {
             NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 3), xRadius: 9, yRadius: 9).fill()
         }
 
-        drawIcon()
         drawQuotaLines()
     }
 
-    private func drawIcon() {
-        guard let image = NSImage(systemSymbolName: "person.crop.circle.badge.checkmark", accessibilityDescription: "Codex Auth") else {
-            return
-        }
-        image.isTemplate = true
-        statusBarTextColor.set()
-        let iconSize: CGFloat = 18
-        let iconY = max(0, ((bounds.height - iconSize) / 2) - 1)
-        image.draw(in: NSRect(x: 7, y: iconY, width: iconSize, height: iconSize), from: .zero, operation: .sourceOver, fraction: 1)
-    }
-
+    /// 绘制额度片段，并根据当前片段数量保持整体垂直居中。
     private func drawQuotaLines() {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .semibold)
-        let x: CGFloat = 29
-        let lineHeight: CGFloat = 10
-        let topY = bounds.midY + 1
+        let x: CGFloat = 4
+        let lineSpacing: CGFloat = 10
+        let textHeight = ceil(font.ascender - font.descender + font.leading)
+        let lineOrigins = presentation.lineOrigins(
+            containerHeight: bounds.height,
+            textHeight: textHeight,
+            lineSpacing: lineSpacing
+        )
 
         for (index, segment) in presentation.segments.enumerated() {
-            let y = topY - CGFloat(index) * lineHeight
+            let y = lineOrigins[index]
             let parts = splitQuotaText(segment.text)
             let prefixAttributes: [NSAttributedString.Key: Any] = [
                 .font: font,
@@ -254,10 +267,6 @@ private final class QuotaStatusItemView: NSView {
         let prefix = String(text[...spaceIndex])
         let percent = String(text[text.index(after: spaceIndex)...])
         return (prefix, percent)
-    }
-
-    private var statusBarTextColor: NSColor {
-        NSColor.white.withAlphaComponent(0.96)
     }
 
     private var statusBarLabelColor: NSColor {
