@@ -39,7 +39,7 @@ struct StatusItemPresentation: Equatable {
     }
 
     var minimumStatusItemLength: CGFloat {
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .semibold)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
         let textWidth = segments
             .map { ($0.text as NSString).size(withAttributes: [.font: font]).width }
             .max() ?? 0
@@ -233,7 +233,7 @@ private final class QuotaStatusItemView: NSView {
 
     /// 绘制额度片段，并根据当前片段数量保持整体垂直居中。
     private func drawQuotaLines() {
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .semibold)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
         let x: CGFloat = 4
         let lineSpacing: CGFloat = 10
         let textHeight = ceil(font.ascender - font.descender + font.leading)
