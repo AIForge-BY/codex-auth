@@ -8,6 +8,11 @@ struct StatusItemSegment: Equatable {
 }
 
 struct StatusItemPresentation: Equatable {
+    /// 百分比底色保持左右各 7pt 内边距。
+    static let capsuleHorizontalPadding: CGFloat = 14
+    /// 状态项仅保留左右各 1pt 外边距，以缩短菜单栏占用。
+    static let statusItemOuterPadding: CGFloat = 2
+
     let segments: [StatusItemSegment]
     let isLoading: Bool
 
@@ -44,7 +49,7 @@ struct StatusItemPresentation: Equatable {
         let textWidth = segments
             .map { ($0.text as NSString).size(withAttributes: [.font: font]).width }
             .max() ?? 0
-        let horizontalPaddingWidth: CGFloat = 22
+        let horizontalPaddingWidth = Self.capsuleHorizontalPadding + Self.statusItemOuterPadding
         return ceil(textWidth + horizontalPaddingWidth)
     }
 
@@ -235,9 +240,10 @@ private final class QuotaStatusItemView: NSView {
     /// 绘制额度片段，并根据当前片段数量保持整体垂直居中。
     private func drawQuotaLines() {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
-        let x: CGFloat = 4
+        let x = StatusItemPresentation.statusItemOuterPadding / 2
         let lineSpacing: CGFloat = 10
         let textHeight = ceil(font.ascender - font.descender + font.leading)
+        let capsuleVerticalPadding: CGFloat = presentation.segments.count == 1 ? 6 : 2
         let lineOrigins = presentation.lineOrigins(
             containerHeight: bounds.height,
             textHeight: textHeight,
@@ -253,16 +259,16 @@ private final class QuotaStatusItemView: NSView {
             ]
             let percentAttributes: [NSAttributedString.Key: Any] = [
                 .font: font,
-                .foregroundColor: segment.tone.statusItemColor(forActiveMenuBar: true),
+                .foregroundColor: NSColor.white,
             ]
             (parts.prefix as NSString).draw(at: NSPoint(x: x, y: y), withAttributes: prefixAttributes)
             let prefixWidth = (parts.prefix as NSString).size(withAttributes: prefixAttributes).width
             let percentSize = (parts.percent as NSString).size(withAttributes: percentAttributes)
             let capsuleRect = NSRect(
                 x: x + prefixWidth,
-                y: y - 1,
-                width: ceil(percentSize.width) + 14,
-                height: textHeight + 2
+                y: y - capsuleVerticalPadding / 2,
+                width: ceil(percentSize.width) + StatusItemPresentation.capsuleHorizontalPadding,
+                height: textHeight + capsuleVerticalPadding
             )
             segment.tone.statusItemBackgroundColor(forActiveMenuBar: true).setFill()
             NSBezierPath(
@@ -271,7 +277,10 @@ private final class QuotaStatusItemView: NSView {
                 yRadius: capsuleRect.height / 2
             ).fill()
             (parts.percent as NSString).draw(
-                at: NSPoint(x: capsuleRect.minX + 7, y: y),
+                at: NSPoint(
+                    x: capsuleRect.minX + StatusItemPresentation.capsuleHorizontalPadding / 2,
+                    y: y
+                ),
                 withAttributes: percentAttributes
             )
         }
@@ -292,30 +301,17 @@ private final class QuotaStatusItemView: NSView {
 }
 
 private extension UsageTone {
-    var statusItemColor: NSColor {
-        statusItemColor(forActiveMenuBar: false)
-    }
-
-    func statusItemColor(forActiveMenuBar activeMenuBar: Bool) -> NSColor {
-        switch self {
-        case .available:
-            return activeMenuBar ? NSColor(calibratedRed: 0.62, green: 0.82, blue: 0.58, alpha: 1) : NSColor(calibratedRed: 0.18, green: 0.52, blue: 0.32, alpha: 1)
-        case .low:
-            return activeMenuBar ? NSColor(calibratedRed: 0.92, green: 0.58, blue: 0.54, alpha: 1) : NSColor(calibratedRed: 0.78, green: 0.18, blue: 0.16, alpha: 1)
-        case .unavailable:
-            return activeMenuBar ? NSColor.white.withAlphaComponent(0.72) : .secondaryLabelColor
-        }
-    }
-
     /// 返回与额度状态匹配的半透明胶囊底色，并适配菜单栏高亮背景。
     func statusItemBackgroundColor(forActiveMenuBar activeMenuBar: Bool) -> NSColor {
         switch self {
         case .available:
-            return NSColor(calibratedRed: 0.25, green: 0.64, blue: 0.37, alpha: activeMenuBar ? 0.28 : 0.16)
+            return NSColor(calibratedRed: 0.24, green: 0.68, blue: 0.32, alpha: activeMenuBar ? 0.82 : 0.72)
+        case .warning:
+            return NSColor(calibratedRed: 0.90, green: 0.60, blue: 0.10, alpha: activeMenuBar ? 0.86 : 0.76)
         case .low:
-            return NSColor(calibratedRed: 0.86, green: 0.24, blue: 0.20, alpha: activeMenuBar ? 0.32 : 0.18)
+            return NSColor(calibratedRed: 0.86, green: 0.18, blue: 0.16, alpha: activeMenuBar ? 0.86 : 0.76)
         case .unavailable:
-            return NSColor.white.withAlphaComponent(activeMenuBar ? 0.14 : 0.08)
+            return NSColor.white.withAlphaComponent(activeMenuBar ? 0.22 : 0.14)
         }
     }
 }

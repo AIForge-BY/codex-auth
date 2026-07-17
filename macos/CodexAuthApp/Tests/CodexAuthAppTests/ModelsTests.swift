@@ -163,11 +163,16 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(usage.sevenDay.remainingPercent, 93)
     }
 
-    func testMenuBarQuotaToneMatchesExistingUsageThreshold() {
+    /// 验证菜单栏额度在 20% 和 50% 边界正确切换红、黄、绿三档。
+    func testMenuBarQuotaToneUsesGreenYellowAndRedThresholds() {
         let low = UsageWindow(status: "ok", remainingPercent: 19, total: 100, used: 81, resetAt: nil)
-        let available = UsageWindow(status: "ok", remainingPercent: 20, total: 100, used: 80, resetAt: nil)
+        let warningLowerBoundary = UsageWindow(status: "ok", remainingPercent: 20, total: 100, used: 80, resetAt: nil)
+        let warningUpperBoundary = UsageWindow(status: "ok", remainingPercent: 49, total: 100, used: 51, resetAt: nil)
+        let available = UsageWindow(status: "ok", remainingPercent: 50, total: 100, used: 50, resetAt: nil)
 
         XCTAssertEqual(low.menuBarUsageTone, .low)
+        XCTAssertEqual(warningLowerBoundary.menuBarUsageTone, .warning)
+        XCTAssertEqual(warningUpperBoundary.menuBarUsageTone, .warning)
         XCTAssertEqual(available.menuBarUsageTone, .available)
     }
 
@@ -219,7 +224,9 @@ final class ModelsTests: XCTestCase {
 
         XCTAssertEqual(presentation.plainText, "93%")
         XCTAssertEqual(presentation.segments.map(\.tone), [.available])
-        XCTAssertLessThan(presentation.minimumStatusItemLength, 50)
+        XCTAssertLessThan(presentation.minimumStatusItemLength, 45)
+        XCTAssertEqual(StatusItemPresentation.capsuleHorizontalPadding, 14)
+        XCTAssertEqual(StatusItemPresentation.statusItemOuterPadding, 2)
     }
 
     /// 验证单行额度在菜单栏高度内垂直居中，避免文字在移除 5 小时窗口后上移。

@@ -211,11 +211,18 @@ struct UsageWindow: Decodable, Equatable {
         return remainingPercent < 20
     }
 
+    /// 按剩余额度映射菜单栏绿、黄、红三档视觉状态。
     var menuBarUsageTone: UsageTone {
-        guard status == "ok", remainingPercent != nil else {
+        guard status == "ok", let remainingPercent else {
             return .unavailable
         }
-        return isLowRemaining ? .low : .available
+        if remainingPercent < 20 {
+            return .low
+        }
+        if remainingPercent < 50 {
+            return .warning
+        }
+        return .available
     }
 
     private var resetText: String? {
@@ -246,8 +253,10 @@ struct UsageWindow: Decodable, Equatable {
     }
 }
 
+/// 表示额度可用、警告、低额度和不可用四种视觉状态。
 enum UsageTone: Equatable {
     case available
+    case warning
     case low
     case unavailable
 }
