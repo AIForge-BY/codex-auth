@@ -219,7 +219,7 @@ final class ModelsTests: XCTestCase {
 
         XCTAssertEqual(presentation.plainText, "93%")
         XCTAssertEqual(presentation.segments.map(\.tone), [.available])
-        XCTAssertLessThan(presentation.minimumStatusItemLength, 45)
+        XCTAssertLessThan(presentation.minimumStatusItemLength, 50)
     }
 
     /// 验证单行额度在菜单栏高度内垂直居中，避免文字在移除 5 小时窗口后上移。

@@ -44,7 +44,7 @@ struct StatusItemPresentation: Equatable {
         let textWidth = segments
             .map { ($0.text as NSString).size(withAttributes: [.font: font]).width }
             .max() ?? 0
-        let horizontalPaddingWidth: CGFloat = 12
+        let horizontalPaddingWidth: CGFloat = 22
         return ceil(textWidth + horizontalPaddingWidth)
     }
 
@@ -261,7 +261,7 @@ private final class QuotaStatusItemView: NSView {
             let capsuleRect = NSRect(
                 x: x + prefixWidth,
                 y: y - 1,
-                width: ceil(percentSize.width) + 4,
+                width: ceil(percentSize.width) + 14,
                 height: textHeight + 2
             )
             segment.tone.statusItemBackgroundColor(forActiveMenuBar: true).setFill()
@@ -271,7 +271,7 @@ private final class QuotaStatusItemView: NSView {
                 yRadius: capsuleRect.height / 2
             ).fill()
             (parts.percent as NSString).draw(
-                at: NSPoint(x: capsuleRect.minX + 2, y: y),
+                at: NSPoint(x: capsuleRect.minX + 7, y: y),
                 withAttributes: percentAttributes
             )
         }
