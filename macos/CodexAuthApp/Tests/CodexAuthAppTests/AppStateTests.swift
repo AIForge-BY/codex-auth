@@ -159,6 +159,48 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(client.loadStateCallCount, 0)
     }
 
+    /// 验证 25% 和 10% 阈值各提醒一次，并在额度恢复后重新开放提醒资格。
+    func testUsageAlertsTriggerOncePerThresholdAndResetAfterRecovery() async {
+        let client = StubCodexAuthClient(state: makeUsageState(remainingPercent: 24))
+        let presenter = RecordingUsageAlertPresenter()
+        let appState = AppState(client: client, usageAlertPresenter: presenter)
+
+        appState.prepareUsageAlerts()
+        await appState.refresh()
+        client.state = makeUsageState(remainingPercent: 20)
+        await appState.refresh()
+        client.state = makeUsageState(remainingPercent: 9)
+        await appState.refresh()
+        await appState.refresh()
+        client.state = makeUsageState(remainingPercent: 30)
+        await appState.refresh()
+        client.state = makeUsageState(remainingPercent: 24)
+        await appState.refresh()
+
+        XCTAssertEqual(presenter.prepareCallCount, 1)
+        XCTAssertEqual(presenter.alerts.map(\.threshold), [25, 10, 25])
+        XCTAssertEqual(presenter.alerts.map(\.remainingPercent), [24, 9, 24])
+        XCTAssertTrue(presenter.alerts.allSatisfy { $0.windowLabel == "7 天" })
+    }
+
+    /// 验证刷新失败和缺失窗口不会产生低额度提醒。
+    func testUsageAlertsIgnoreUnavailableWindows() async {
+        let unavailableWindow = UsageWindow(
+            status: "network_error",
+            remainingPercent: nil,
+            total: nil,
+            used: nil,
+            resetAt: nil
+        )
+        let client = StubCodexAuthClient(state: makeUsageState(sevenDay: unavailableWindow))
+        let presenter = RecordingUsageAlertPresenter()
+        let appState = AppState(client: client, usageAlertPresenter: presenter)
+
+        await appState.refresh()
+
+        XCTAssertTrue(presenter.alerts.isEmpty)
+    }
+
     func testSwitchResultIsNotOverwrittenByOlderRefresh() async {
         let original = CodexAuthState(
             schemaVersion: 1,
@@ -197,6 +239,59 @@ final class AppStateTests: XCTestCase {
         XCTAssertEqual(appState.state?.activeAccountKey, "acct-2")
         XCTAssertEqual(appState.notice, "已切换账号。新的 Codex CLI 会话将使用此账号。")
     }
+}
+
+/// 记录提醒展示调用，避免单元测试访问真实系统通知中心。
+@MainActor
+final class RecordingUsageAlertPresenter: UsageAlertPresenting {
+    private(set) var prepareCallCount = 0
+    private(set) var alerts: [UsageAlert] = []
+
+    /// 记录通知权限准备调用，不访问真实系统通知中心。
+    func prepare() {
+        prepareCallCount += 1
+    }
+
+    /// 记录阈值提醒，供 AppState 测试断言。
+    func present(_ alert: UsageAlert) {
+        alerts.append(alert)
+    }
+}
+
+/// 创建仅包含 7 天窗口的测试状态，默认窗口状态为可用。
+private func makeUsageState(
+    remainingPercent: Int? = nil,
+    sevenDay: UsageWindow? = nil
+) -> CodexAuthState {
+    let resolvedSevenDay = sevenDay ?? UsageWindow(
+        status: "ok",
+        remainingPercent: remainingPercent,
+        total: 100,
+        used: remainingPercent.map { 100 - $0 },
+        resetAt: nil
+    )
+    let account = CodexAccount(
+        accountKey: "acct-alert",
+        displayName: "提醒账号",
+        alias: "提醒账号",
+        email: "alert@example.com",
+        accountName: nil,
+        plan: "pro",
+        authMode: "chatgpt",
+        isActive: true,
+        usage: UsageInfo(fiveHour: nil, sevenDay: resolvedSevenDay),
+        lastUsageAt: nil,
+        lastRefreshAt: nil
+    )
+    return CodexAuthState(
+        schemaVersion: 1,
+        codexHome: "/tmp/codex",
+        activeAccountKey: account.accountKey,
+        generatedAt: Date(timeIntervalSince1970: 0),
+        refresh: RefreshInfo(attempted: true, status: "ok", message: nil),
+        warnings: [],
+        accounts: [account]
+    )
 }
 
 final class StubCodexAuthClient: CodexAuthClientProtocol {

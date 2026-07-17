@@ -20,3 +20,7 @@ benchmark/*
 
 # Local brainstorming companion artifacts
 .superpowers/
+
+# Local one-shot desktop delivery state
+.agent/desktop-delivery-ready.json
+.agent/desktop-delivery-ready.tmp

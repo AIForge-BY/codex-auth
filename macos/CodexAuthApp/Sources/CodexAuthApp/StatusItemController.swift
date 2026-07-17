@@ -38,12 +38,13 @@ struct StatusItemPresentation: Equatable {
         segments.map(\.text).joined(separator: "\n")
     }
 
+    /// 预留状态项外边距和百分比胶囊内边距，避免圆角底色贴近边界。
     var minimumStatusItemLength: CGFloat {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
         let textWidth = segments
             .map { ($0.text as NSString).size(withAttributes: [.font: font]).width }
             .max() ?? 0
-        let horizontalPaddingWidth: CGFloat = 8
+        let horizontalPaddingWidth: CGFloat = 12
         return ceil(textWidth + horizontalPaddingWidth)
     }
 
@@ -256,7 +257,23 @@ private final class QuotaStatusItemView: NSView {
             ]
             (parts.prefix as NSString).draw(at: NSPoint(x: x, y: y), withAttributes: prefixAttributes)
             let prefixWidth = (parts.prefix as NSString).size(withAttributes: prefixAttributes).width
-            (parts.percent as NSString).draw(at: NSPoint(x: x + prefixWidth, y: y), withAttributes: percentAttributes)
+            let percentSize = (parts.percent as NSString).size(withAttributes: percentAttributes)
+            let capsuleRect = NSRect(
+                x: x + prefixWidth,
+                y: y - 1,
+                width: ceil(percentSize.width) + 4,
+                height: textHeight + 2
+            )
+            segment.tone.statusItemBackgroundColor(forActiveMenuBar: true).setFill()
+            NSBezierPath(
+                roundedRect: capsuleRect,
+                xRadius: capsuleRect.height / 2,
+                yRadius: capsuleRect.height / 2
+            ).fill()
+            (parts.percent as NSString).draw(
+                at: NSPoint(x: capsuleRect.minX + 2, y: y),
+                withAttributes: percentAttributes
+            )
         }
     }
 
@@ -287,6 +304,18 @@ private extension UsageTone {
             return activeMenuBar ? NSColor(calibratedRed: 0.92, green: 0.58, blue: 0.54, alpha: 1) : NSColor(calibratedRed: 0.78, green: 0.18, blue: 0.16, alpha: 1)
         case .unavailable:
             return activeMenuBar ? NSColor.white.withAlphaComponent(0.72) : .secondaryLabelColor
+        }
+    }
+
+    /// 返回与额度状态匹配的半透明胶囊底色，并适配菜单栏高亮背景。
+    func statusItemBackgroundColor(forActiveMenuBar activeMenuBar: Bool) -> NSColor {
+        switch self {
+        case .available:
+            return NSColor(calibratedRed: 0.25, green: 0.64, blue: 0.37, alpha: activeMenuBar ? 0.28 : 0.16)
+        case .low:
+            return NSColor(calibratedRed: 0.86, green: 0.24, blue: 0.20, alpha: activeMenuBar ? 0.32 : 0.18)
+        case .unavailable:
+            return NSColor.white.withAlphaComponent(activeMenuBar ? 0.14 : 0.08)
         }
     }
 }

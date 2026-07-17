@@ -12,12 +12,19 @@ final class AppState: ObservableObject {
     @Published var pendingDeleteAccount: CodexAccount?
 
     private let client: CodexAuthClientProtocol
+    private let usageAlertPresenter: UsageAlertPresenting
+    private var usageAlertTracker = UsageAlertTracker()
     private var didRefreshOnAppLaunch = false
     private var periodicRefreshTask: Task<Void, Never>?
     private var loadSequence = 0
 
-    init(client: CodexAuthClientProtocol = CodexAuthCLIClient()) {
+    /// 注入状态客户端和低额度展示器，便于隔离系统通知并测试阈值行为。
+    init(
+        client: CodexAuthClientProtocol = CodexAuthCLIClient(),
+        usageAlertPresenter: UsageAlertPresenting? = nil
+    ) {
         self.client = client
+        self.usageAlertPresenter = usageAlertPresenter ?? DisabledUsageAlertPresenter()
     }
 
     deinit {
@@ -26,6 +33,11 @@ final class AppState: ObservableObject {
 
     var isShowingDeleteConfirmation: Bool {
         pendingDeleteAccount != nil
+    }
+
+    /// 提前准备系统通知权限，避免首次低额度事件只出现授权提示。
+    func prepareUsageAlerts() {
+        usageAlertPresenter.prepare()
     }
 
     func refresh(apiMode: CodexAuthAPIMode = .automatic) async {
@@ -152,6 +164,7 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// 串行化状态结果写入，仅接受最新请求并在成功后检查低额度提醒。
     private func load(_ operation: () async throws -> CodexAuthState) async {
         loadSequence += 1
         let sequence = loadSequence
@@ -166,11 +179,19 @@ final class AppState: ObservableObject {
             let loadedState = try await operation()
             if sequence == loadSequence {
                 state = loadedState
+                presentUsageAlerts(for: loadedState)
             }
         } catch {
             if sequence == loadSequence {
                 errorMessage = error.localizedDescription
             }
+        }
+    }
+
+    /// 对最新活动账号执行阈值去重，并展示本次新增的低额度提醒。
+    private func presentUsageAlerts(for state: CodexAuthState) {
+        for alert in usageAlertTracker.alerts(for: state.activeAccount) {
+            usageAlertPresenter.present(alert)
         }
     }
 }
