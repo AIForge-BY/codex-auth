@@ -9,6 +9,10 @@ final class ModelsTests: XCTestCase {
           "codex_home": "/Users/me/.codex",
           "active_account_key": "acct-1",
           "generated_at": "2026-06-29T12:00:00Z",
+          "reset_credits": {
+            "available_count": 2,
+            "expires_at": "2026-07-30T00:00:00Z"
+          },
           "refresh": {
             "attempted": true,
             "status": "ok",
@@ -57,6 +61,8 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(state.accounts[0].planLabel, "Pro")
         XCTAssertEqual(state.accounts[0].fiveHourUsageText, "99%（6月30日 01:00刷新）")
         XCTAssertEqual(state.accounts[0].sevenDayUsageText, "100%（7月6日 20:00刷新）")
+        XCTAssertEqual(state.resetCredits?.availableCount, 2)
+        XCTAssertEqual(state.resetCredits?.menuBarText, "重置 2次 · 7月30日 08:00")
     }
 
     func testAccountLabelsUseMaskedEmailWhenAliasIsMissing() {
@@ -196,9 +202,9 @@ final class ModelsTests: XCTestCase {
 
         let presentation = StatusItemPresentation(account: account, isLoading: false)
 
-        XCTAssertEqual(presentation.plainText, "5h 99%\n7d 12%")
-        XCTAssertEqual(presentation.segments.map(\.tone), [.available, .low])
-        XCTAssertLessThan(presentation.minimumStatusItemLength, 78)
+        XCTAssertEqual(presentation.plainText, "12%")
+        XCTAssertEqual(presentation.segments.map(\.tone), [.low])
+        XCTAssertLessThan(presentation.minimumStatusItemLength, 45)
     }
 
     /// 验证缺少 5 小时窗口时菜单栏只保留周用量片段。
@@ -227,6 +233,24 @@ final class ModelsTests: XCTestCase {
         XCTAssertLessThan(presentation.minimumStatusItemLength, 45)
         XCTAssertEqual(StatusItemPresentation.capsuleHorizontalPadding, 14)
         XCTAssertEqual(StatusItemPresentation.statusItemOuterPadding, 2)
+    }
+
+    func testStatusItemPresentationShowsResetCredits() {
+        let account = CodexAccount.sample(accountKey: "acct-123456", alias: "工作号", isActive: true)
+        let resetCredits = ResetCreditsInfo(
+            availableCount: 1,
+            expiresAt: Date(timeIntervalSince1970: 1_783_046_400)
+        )
+
+        let presentation = StatusItemPresentation(
+            account: account,
+            isLoading: false,
+            resetCredits: resetCredits
+        )
+
+        XCTAssertEqual(presentation.plainText, "100%")
+        XCTAssertEqual(presentation.segments.last?.tone, .available)
+        XCTAssertEqual(resetCredits.accountDetailText, "重置: 1次  7月3日 10:40")
     }
 
     /// 验证单行额度在菜单栏高度内垂直居中，避免文字在移除 5 小时窗口后上移。
@@ -261,7 +285,7 @@ final class ModelsTests: XCTestCase {
 
         XCTAssertEqual(
             presentation.lineOrigins(containerHeight: 24, textHeight: 11, lineSpacing: 10),
-            [11, 1]
+            [6]
         )
     }
 }

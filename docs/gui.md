@@ -33,6 +33,7 @@ Top-level fields:
 - `codex_home`: resolved Codex home path.
 - `active_account_key`: active account key or `null`.
 - `generated_at`: Unix timestamp in seconds.
+- `reset_credits`: reset opportunities for the active ChatGPT account during a GUI refresh, or `null` when unavailable.
 - `refresh`: refresh metadata.
 - `warnings`: reserved string array.
 - `accounts`: account rows.
@@ -59,6 +60,11 @@ Usage window fields:
 - `total`: currently `100` when known.
 - `used`: integer used percentage or `null`.
 - `reset_at`: Unix timestamp in seconds or `null`.
+
+Reset credit fields:
+
+- `available_count`: number of Codex rate-limit resets that can be applied directly.
+- `expires_at`: earliest expiration timestamp among available reset credits, or `null`.
 
 ## Switching Semantics
 

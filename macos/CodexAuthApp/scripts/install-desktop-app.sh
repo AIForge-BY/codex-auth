@@ -159,7 +159,11 @@ main() {
   fi
 
   echo "Launching $APP_BUNDLE..."
-  /usr/bin/open -n "$APP_BUNDLE"
+  # 检查 Launch Services 的真实返回值，避免仅凭短暂进程误报启动成功。
+  if ! /usr/bin/open -n "$APP_BUNDLE"; then
+    echo "Launch Services failed to open the desktop app bundle." >&2
+    return 1
+  fi
   if ! wait_for_app_to_start; then
     echo "The desktop app did not start in time." >&2
     return 1

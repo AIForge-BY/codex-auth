@@ -32,6 +32,7 @@ struct AccountRow: View {
                             .lineLimit(1)
                     }
                     usageLine
+                    resetCreditsLine
                 }
 
                 Spacer()
@@ -68,6 +69,21 @@ struct AccountRow: View {
         .font(.caption)
         .lineLimit(2)
         .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// 展示 reset 查询状态，避免空白让用户误以为功能未生效。
+    private var resetCreditsLine: some View {
+        let text: String
+        if let resetCredits = account.resetCredits {
+            text = resetCredits.accountDetailText
+        } else if appState.isLoading || appState.state?.refresh.attempted != true {
+            text = "重置: 查询中"
+        } else {
+            text = "重置: 查询失败"
+        }
+        return Text(text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
     }
 
     private func usageText(prefix: String, window: UsageWindow) -> Text {

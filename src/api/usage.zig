@@ -4,6 +4,17 @@ const chatgpt_http = @import("http.zig");
 const registry = @import("../registry/root.zig");
 
 pub const default_usage_endpoint = "https://chatgpt.com/backend-api/wham/usage";
+pub const default_reset_credits_endpoint = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+
+pub const ResetCreditsInfo = struct {
+    available_count: i64,
+    earliest_expires_at: ?[]u8,
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        if (self.earliest_expires_at) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
 
 pub const UsageFetchResult = struct {
     snapshot: ?registry.RateLimitSnapshot,
@@ -58,6 +69,34 @@ pub fn fetchActiveUsageDetailed(allocator: std.mem.Allocator, codex_home: []cons
     defer allocator.free(auth_path);
 
     return try fetchUsageForAuthPathDetailed(allocator, auth_path);
+}
+
+// 查询当前活动账号可直接使用的 Codex reset credit；详情接口失败时由调用方按 best-effort 处理。
+pub fn fetchActiveResetCredits(allocator: std.mem.Allocator, codex_home: []const u8) !?ResetCreditsInfo {
+    const auth_path = try registry.activeAuthPath(allocator, codex_home);
+    defer allocator.free(auth_path);
+    return try fetchResetCreditsForAuthPath(allocator, auth_path);
+}
+
+// 读取账号认证信息并请求 reset credit 详情，不返回任何认证内容。
+pub fn fetchResetCreditsForAuthPath(allocator: std.mem.Allocator, auth_path: []const u8) !?ResetCreditsInfo {
+    const info = try auth.parseAuthInfo(allocator, auth_path);
+    defer info.deinit(allocator);
+
+    if (info.auth_mode != .chatgpt) return null;
+    const access_token = info.access_token orelse return null;
+    const chatgpt_account_id = info.chatgpt_account_id orelse return null;
+    const http_result = try chatgpt_http.runGetJsonCommand(
+        allocator,
+        default_reset_credits_endpoint,
+        access_token,
+        chatgpt_account_id,
+    );
+    defer allocator.free(http_result.body);
+    if (http_result.status_code == null or http_result.status_code.? < 200 or http_result.status_code.? > 299) {
+        return null;
+    }
+    return try parseResetCreditsResponse(allocator, http_result.body);
 }
 
 pub fn fetchUsageForAuthPath(allocator: std.mem.Allocator, auth_path: []const u8) !?registry.RateLimitSnapshot {
@@ -292,6 +331,50 @@ pub fn parseUsageResponse(allocator: std.mem.Allocator, body: []const u8) !?regi
     }
 
     return snapshot;
+}
+
+// 解析 reset credit 接口，只保留可用数量和最近的到期时间，避免把完整详情带入 GUI 状态。
+pub fn parseResetCreditsResponse(allocator: std.mem.Allocator, body: []const u8) !?ResetCreditsInfo {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const root_obj = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return null,
+    };
+    const available_count = switch (root_obj.get("available_count") orelse return null) {
+        .integer => |value| @max(value, 0),
+        else => return null,
+    };
+
+    var earliest_expires_at: ?[]u8 = null;
+    if (root_obj.get("credits")) |credits| switch (credits) {
+        .array => |items| for (items.items) |item| {
+            const credit_obj = switch (item) {
+                .object => |obj| obj,
+                else => continue,
+            };
+            const status = switch (credit_obj.get("status") orelse continue) {
+                .string => |value| value,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, status, "available")) continue;
+            const expires_at = switch (credit_obj.get("expires_at") orelse continue) {
+                .string => |value| value,
+                else => continue,
+            };
+            if (expires_at.len == 0) continue;
+            if (earliest_expires_at == null or std.mem.lessThan(u8, expires_at, earliest_expires_at.?)) {
+                if (earliest_expires_at) |old| allocator.free(old);
+                earliest_expires_at = try allocator.dupe(u8, expires_at);
+            }
+        },
+        else => {},
+    };
+
+    return .{
+        .available_count = available_count,
+        .earliest_expires_at = earliest_expires_at,
+    };
 }
 
 fn parseWindow(v: std.json.Value) ?registry.RateLimitWindow {

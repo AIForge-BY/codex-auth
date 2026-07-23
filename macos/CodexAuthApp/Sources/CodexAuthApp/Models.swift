@@ -23,6 +23,7 @@ struct CodexAuthState: Decodable, Equatable {
     let activeAccountKey: String?
     let generatedAt: Date
     let refresh: RefreshInfo
+    var resetCredits: ResetCreditsInfo? = nil
     let warnings: [String]
     let accounts: [CodexAccount]
 
@@ -37,9 +38,27 @@ struct CodexAuthState: Decodable, Equatable {
             activeAccountKey: nil,
             generatedAt: Date(timeIntervalSince1970: 0),
             refresh: RefreshInfo(attempted: false, status: "skipped", message: nil),
+            resetCredits: nil,
             warnings: [],
             accounts: []
         )
+    }
+}
+
+struct ResetCreditsInfo: Decodable, Equatable {
+    let availableCount: Int
+    let expiresAt: Date?
+
+    /// 返回账户详情使用的 reset 文案，不携带菜单栏胶囊中的分隔符。
+    var accountDetailText: String {
+        let expiry = expiresAt.map { "  \(UsageResetDateFormatter.string(from: $0))" } ?? ""
+        return "重置: \(availableCount)次\(expiry)"
+    }
+
+    /// 返回菜单栏使用的 reset 摘要，日期使用本地时区显示。
+    var menuBarText: String {
+        let expiry = expiresAt.map { " · \(UsageResetDateFormatter.string(from: $0))" } ?? ""
+        return "重置 \(availableCount)次\(expiry)"
     }
 }
 
@@ -57,6 +76,7 @@ struct CodexAccount: Decodable, Identifiable, Equatable {
     let accountName: String?
     let plan: String?
     let authMode: String?
+    var resetCredits: ResetCreditsInfo? = nil
     let isActive: Bool
     let usage: UsageInfo
     let lastUsageAt: Date?

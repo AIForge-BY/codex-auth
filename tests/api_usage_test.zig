@@ -106,6 +106,26 @@ test "parse usage api response maps prolite plan" {
     try std.testing.expectEqual(registry.PlanType.prolite, snapshot.plan_type.?);
 }
 
+test "parse reset credit response keeps available count and earliest expiration" {
+    const body =
+        \\{
+        \\  "available_count": 2,
+        \\  "credits": [
+        \\    {"id": "later", "status": "available", "expires_at": "2026-08-20T00:00:00Z"},
+        \\    {"id": "used", "status": "redeemed", "expires_at": "2026-07-20T00:00:00Z"},
+        \\    {"id": "earlier", "status": "available", "expires_at": "2026-07-30T00:00:00Z"}
+        \\  ]
+        \\}
+    ;
+
+    var reset_credits = (try usage_api.parseResetCreditsResponse(std.testing.allocator, body)) orelse
+        return error.TestExpectedEqual;
+    defer reset_credits.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(i64, 2), reset_credits.available_count);
+    try std.testing.expectEqualStrings("2026-07-30T00:00:00Z", reset_credits.earliest_expires_at.?);
+}
+
 test "fetch usage for API key auth skips ChatGPT usage refresh without missing auth" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

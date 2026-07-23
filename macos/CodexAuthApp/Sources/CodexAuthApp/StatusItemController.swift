@@ -17,40 +17,32 @@ struct StatusItemPresentation: Equatable {
     let isLoading: Bool
 
     /// 根据账号实际返回的窗口生成菜单栏片段，缺失的 5 小时窗口不会占位。
-    init(account: CodexAccount?, isLoading: Bool) {
+    init(account: CodexAccount?, isLoading: Bool, resetCredits: ResetCreditsInfo? = nil) {
         self.isLoading = isLoading
-        var segments: [StatusItemSegment] = []
-        if let account, let fiveHour = account.usage.fiveHour, let text = account.menuBarFiveHourText {
-            segments.append(StatusItemSegment(text: text, tone: fiveHour.menuBarUsageTone))
-            segments.append(
-                StatusItemSegment(
-                    text: account.menuBarSevenDayText,
-                    tone: account.usage.sevenDay.menuBarUsageTone
-                )
+        // 顶部状态栏只显示周用量百分比；reset 详情仅展示在账号展开行中。
+        _ = resetCredits
+        self.segments = [
+            StatusItemSegment(
+                text: account?.usage.sevenDay.menuBarPercentText ?? "--",
+                tone: account?.usage.sevenDay.menuBarUsageTone ?? .unavailable
             )
-        } else {
-            segments.append(
-                StatusItemSegment(
-                    text: account?.usage.sevenDay.menuBarPercentText ?? "--",
-                    tone: account?.usage.sevenDay.menuBarUsageTone ?? .unavailable
-                )
-            )
-        }
-        self.segments = segments
+        ]
     }
 
     var plainText: String {
         segments.map(\.text).joined(separator: "\n")
     }
 
-    /// 预留状态项外边距和百分比胶囊内边距，避免圆角底色贴近边界。
+    /// 将多行状态压缩成系统状态栏按钮可稳定显示的单行文本。
+    var statusBarButtonText: String {
+        segments.map(\.text).joined(separator: "  ")
+    }
+
+    /// 计算系统按钮承载完整状态文本所需的宽度。
     var minimumStatusItemLength: CGFloat {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
-        let textWidth = segments
-            .map { ($0.text as NSString).size(withAttributes: [.font: font]).width }
-            .max() ?? 0
-        let horizontalPaddingWidth = Self.capsuleHorizontalPadding + Self.statusItemOuterPadding
-        return ceil(textWidth + horizontalPaddingWidth)
+        let textWidth = (statusBarButtonText as NSString).size(withAttributes: [.font: font]).width
+        return ceil(textWidth + 16)
     }
 
     /// 按实际片段数量计算从上到下的绘制原点，使单行和双行内容都整体垂直居中。
@@ -135,11 +127,14 @@ final class StatusItemController: NSObject, ObservableObject {
     private func updateStatusItem() {
         let presentation = StatusItemPresentation(
             account: appState.state?.activeAccount,
-            isLoading: appState.isLoading
+            isLoading: appState.isLoading,
+            resetCredits: appState.state?.resetCredits
         )
         statusItem.length = presentation.minimumStatusItemLength
+        // 自绘视图统一计算背景、文字和垂直位置，避免系统按钮默认基线造成视觉偏移。
         statusItemView.frame.size.width = presentation.minimumStatusItemLength
         statusItemView.presentation = presentation
+        statusItemView.isHidden = false
     }
 
     @objc private func togglePopover(_ sender: NSStatusBarButton) {

@@ -3,6 +3,7 @@ const app_runtime = @import("../core/runtime.zig");
 const cli = @import("../cli/root.zig");
 const io_util = @import("../core/io_util.zig");
 const registry = @import("../registry/root.zig");
+const usage_api = @import("../api/usage.zig");
 const live_flow = @import("live.zig");
 const login_workflow = @import("login.zig");
 const usage_refresh = @import("usage.zig");
@@ -33,6 +34,13 @@ fn handleState(
     const attempted = force_refresh;
     var refresh_state: ?usage_refresh.ForegroundUsageRefreshState = null;
     defer if (refresh_state) |*state| state.deinit(allocator);
+    var reset_credits_by_account: ?[]?usage_api.ResetCreditsInfo = null;
+    defer if (reset_credits_by_account) |values| {
+        for (values) |*value| {
+            if (value.*) |*info| info.deinit(allocator);
+        }
+        allocator.free(values);
+    };
 
     if (force_refresh) {
         const usage_api_enabled = apiModeUsesApi(reg.api.usage, opts.api_mode);
@@ -43,6 +51,28 @@ fn handleState(
             usage_api_enabled,
             opts.active_only,
         );
+        if (usage_api_enabled) {
+            const values = try allocator.alloc(?usage_api.ResetCreditsInfo, reg.accounts.items.len);
+            reset_credits_by_account = values;
+            for (values) |*value| value.* = null;
+            // 打开菜单时在后台一次查询全部账号，完成后由 GUI 一次性更新详情。
+            for (reg.accounts.items, 0..) |account, idx| {
+                const auth_path = registry.accountAuthPath(allocator, codex_home, account.account_key) catch continue;
+                defer allocator.free(auth_path);
+                values[idx] = usage_api.fetchResetCreditsForAuthPath(allocator, auth_path) catch null;
+            }
+        }
+    }
+    var active_reset_credits: ?*const usage_api.ResetCreditsInfo = null;
+    if (reset_credits_by_account) |values| {
+        for (reg.accounts.items, 0..) |account, idx| {
+            if (reg.active_account_key) |active_key| {
+                if (std.mem.eql(u8, active_key, account.account_key)) {
+                    if (values[idx]) |*value| active_reset_credits = value;
+                    break;
+                }
+            }
+        }
     }
     try writeStateJson(
         allocator,
@@ -51,6 +81,8 @@ fn handleState(
         attempted,
         if (attempted) "ok" else "skipped",
         null,
+        active_reset_credits,
+        reset_credits_by_account,
         if (refresh_state) |state| state.usage_overrides else null,
     );
 }
@@ -63,14 +95,15 @@ fn handleSwitch(allocator: std.mem.Allocator, codex_home: []const u8, account_ke
     }
     try registry.activateAccountByKey(allocator, codex_home, &reg, account_key);
     try registry.saveRegistry(allocator, codex_home, &reg);
-    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null);
+    // 切换账号只更新本地活动账号，reset 数据由打开菜单时的后台刷新补齐。
+    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null, null, null);
 }
 
 fn handleLogin(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.types.LoginOptions) !void {
     try login_workflow.handleLogin(allocator, codex_home, opts);
     var reg = try registry.loadRegistry(allocator, codex_home);
     defer reg.deinit(allocator);
-    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null);
+    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null, null, null);
 }
 
 fn handleImport(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.types.GuiImportOptions) !void {
@@ -82,7 +115,7 @@ fn handleImport(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.
         try registry.saveRegistry(allocator, codex_home, &reg);
     }
     if (report.failure != null) return error.ImportFailed;
-    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null);
+    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null, null, null);
 }
 
 fn handleRemove(allocator: std.mem.Allocator, codex_home: []const u8, account_key: []const u8) !void {
@@ -91,7 +124,7 @@ fn handleRemove(allocator: std.mem.Allocator, codex_home: []const u8, account_ke
     const idx = registry.findAccountIndexByAccountKey(&reg, account_key) orelse return error.AccountNotFound;
     var selected = [_]usize{idx};
     try live_flow.removeSelectedAccountsAndPersist(allocator, codex_home, &reg, selected[0..], false);
-    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null);
+    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null, null, null);
 }
 
 fn handleAlias(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.types.GuiAliasOptions) !void {
@@ -109,7 +142,7 @@ fn handleAlias(allocator: std.mem.Allocator, codex_home: []const u8, opts: cli.t
         },
     }
     try registry.saveRegistry(allocator, codex_home, &reg);
-    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null);
+    try writeStateJson(allocator, codex_home, &reg, false, "skipped", null, null, null, null);
 }
 
 // 输出 macOS GUI 使用的状态 JSON，并把本轮刷新失败状态合并到展示层用量字段中。
@@ -120,6 +153,8 @@ fn writeStateJson(
     refresh_attempted: bool,
     refresh_status: []const u8,
     refresh_message: ?[]const u8,
+    reset_credits: ?*const usage_api.ResetCreditsInfo,
+    reset_credits_by_account: ?[]const ?usage_api.ResetCreditsInfo,
     usage_overrides: ?[]const ?[]const u8,
 ) !void {
     _ = allocator;
@@ -135,6 +170,14 @@ fn writeStateJson(
     try out.writeAll(",\"active_account_key\":");
     try writeOptionalJsonString(out, reg.active_account_key);
     try out.print(",\"generated_at\":{d},", .{now});
+    try out.writeAll("\"reset_credits\":");
+    if (reset_credits) |value| {
+        try out.print("{{\"available_count\":{d},\"expires_at\":", .{value.available_count});
+        try writeOptionalJsonString(out, value.earliest_expires_at);
+        try out.writeAll("},");
+    } else {
+        try out.writeAll("null,");
+    }
     try out.print("\"refresh\":{{\"attempted\":{},\"status\":", .{refresh_attempted});
     try writeJsonString(out, refresh_status);
     try out.writeAll(",\"message\":");
@@ -142,7 +185,11 @@ fn writeStateJson(
     try out.writeAll("},\"warnings\":[],\"accounts\":[");
     for (reg.accounts.items, 0..) |rec, idx| {
         if (idx != 0) try out.writeAll(",");
-        try writeAccountJson(out, reg, &rec, now, usageOverrideForAccount(usage_overrides, idx));
+        const account_reset_credits = if (reset_credits_by_account) |values|
+            if (values[idx]) |*value| value else null
+        else
+            null;
+        try writeAccountJson(out, reg, &rec, now, usageOverrideForAccount(usage_overrides, idx), account_reset_credits);
     }
     try out.writeAll("]}\n");
     try out.flush();
@@ -155,6 +202,7 @@ fn writeAccountJson(
     rec: *const registry.AccountRecord,
     now: i64,
     usage_override: ?[]const u8,
+    reset_credits: ?*const usage_api.ResetCreditsInfo,
 ) !void {
     try out.writeAll("{\"account_key\":");
     try writeJsonString(out, rec.account_key);
@@ -172,6 +220,8 @@ fn writeAccountJson(
     } else {
         try out.writeAll("null");
     }
+    try out.writeAll(",\"reset_credits\":");
+    try writeOptionalResetCreditsJson(out, reset_credits);
     try out.writeAll(",\"auth_mode\":");
     if (rec.auth_mode) |mode| {
         try writeJsonString(out, @tagName(mode));
@@ -190,6 +240,17 @@ fn writeAccountJson(
     try out.writeAll(",\"last_refresh_at\":");
     try writeOptionalInt(out, rec.last_usage_at);
     try out.writeAll("}");
+}
+
+// 输出单个账号可直接使用的 Codex reset 机会。
+fn writeOptionalResetCreditsJson(out: *std.Io.Writer, reset_credits: ?*const usage_api.ResetCreditsInfo) !void {
+    if (reset_credits) |value| {
+        try out.print("{{\"available_count\":{d},\"expires_at\":", .{value.available_count});
+        try writeOptionalJsonString(out, value.earliest_expires_at);
+        try out.writeAll("}");
+    } else {
+        try out.writeAll("null");
+    }
 }
 
 // 输出可选用量窗口；接口没有明确返回该窗口时使用 null，避免展示猜测数据。

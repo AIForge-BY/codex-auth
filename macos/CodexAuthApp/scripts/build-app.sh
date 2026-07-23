@@ -71,4 +71,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+# 为本地构建的 App Bundle 生成一致的临时签名，确保 Finder 和 Launch Services 能识别启动入口。
+codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null
+
 echo "$APP_BUNDLE"
